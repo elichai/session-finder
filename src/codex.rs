@@ -58,6 +58,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
     let mut cwd = None;
     let mut updated = None;
     let mut search_text = String::new();
+    let mut preview = String::new();
 
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { continue };
@@ -73,6 +74,12 @@ pub fn parse_file(path: &Path) -> Option<Session> {
             let Some(meta) = record.get("payload") else {
                 continue;
             };
+            if matches!(
+                meta.get("thread_source").and_then(Value::as_str),
+                Some("guardian_review" | "subagent")
+            ) {
+                return None;
+            }
             let Some(meta_id) = meta.get("id").and_then(Value::as_str) else {
                 continue;
             };
@@ -97,6 +104,17 @@ pub fn parse_file(path: &Path) -> Option<Session> {
                 for block in blocks {
                     if block.get("type").and_then(Value::as_str) == Some("input_text") {
                         if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            let candidate = text.trim_start();
+                            // Codex records injected context as user-role messages.
+                            if candidate.starts_with("# AGENTS.md instructions for ")
+                                || candidate.starts_with("<environment_context>")
+                                || candidate.starts_with("<external_codex_apps_")
+                            {
+                                continue;
+                            }
+                            if preview.is_empty() && !candidate.is_empty() {
+                                preview = candidate.lines().next().unwrap_or_default().to_owned();
+                            }
                             if !search_text.is_empty() {
                                 search_text.push('\n');
                             }
@@ -113,7 +131,11 @@ pub fn parse_file(path: &Path) -> Option<Session> {
         id: id?,
         cwd: cwd?,
         updated: updated.unwrap_or(modified),
-        preview: search_text.lines().next().unwrap_or_default().to_owned(),
+        preview: if preview.is_empty() {
+            search_text.lines().next().unwrap_or_default().to_owned()
+        } else {
+            preview
+        },
         search_text,
         archived: false,
     })
@@ -197,6 +219,10 @@ mod tests {
         let path = root.join("rollout-fixture.jsonl");
         let mut file = fs::File::create(&path).unwrap();
         writeln!(file, r#"{{"type":"session_meta","timestamp":"2026-01-02T03:04:05.000Z","payload":{{"id":"019c675d-0e41-7f71-925f-1ccc0da0f692","cwd":"/tmp/project"}}}}"#).unwrap();
+        writeln!(file, r##"{{"type":"response_item","timestamp":"2026-01-02T03:04:05.000Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"# AGENTS.md instructions for /tmp/project"}}]}}}}"##).unwrap();
+        writeln!(file, r#"{{"type":"response_item","timestamp":"2026-01-02T03:04:05.000Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"<environment_context>local</environment_context>"}}]}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"response_item","timestamp":"2026-01-02T03:04:05.000Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"<external_codex_apps_open_page>internal</external_codex_apps_open_page>"}}]}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"response_item","timestamp":"2026-01-02T03:04:05.000Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"<wallet>real request</wallet>"}}]}}}}"#).unwrap();
         writeln!(file, r#"{{"type":"response_item","timestamp":"2026-01-02T03:04:06.000Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"fixture query"}}]}}}}"#).unwrap();
         writeln!(file, "not json").unwrap();
 
@@ -204,11 +230,39 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, "019c675d-0e41-7f71-925f-1ccc0da0f692");
         assert_eq!(found[0].cwd, PathBuf::from("/tmp/project"));
-        assert_eq!(found[0].search_text, "fixture query");
+        assert_eq!(
+            found[0].search_text,
+            "<wallet>real request</wallet>\nfixture query"
+        );
+        assert_eq!(found[0].preview, "<wallet>real request</wallet>");
         assert_eq!(
             found[0].updated,
             parse_timestamp("2026-01-02T03:04:06.000Z").unwrap()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn excludes_internal_codex_threads() {
+        let path =
+            std::env::temp_dir().join(format!("codex-thread-kind-{}.jsonl", std::process::id()));
+        for (kind, expected) in [
+            ("guardian_review", false),
+            ("subagent", false),
+            ("user", true),
+            ("realtime_voice", true),
+        ] {
+            let record = serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "019c675d-0e41-7f71-925f-1ccc0da0f692",
+                    "cwd": "/tmp/project",
+                    "thread_source": kind
+                }
+            });
+            fs::write(&path, format!("{record}\n")).unwrap();
+            assert_eq!(parse_file(&path).is_some(), expected, "{kind}");
+        }
+        fs::remove_file(path).unwrap();
     }
 }

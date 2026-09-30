@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+const CACHE_VERSION: u8 = 2;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Source {
     Claude,
@@ -135,7 +137,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if !status.success() {
             return Err(format!("could not open Codex GUI: {status}").into());
         }
-        println!("Opened {url}");
+        println!(
+            "Sent Codex chat {} to the GUI. PWD: {}\nIf it did not switch chats, run: {}",
+            session.id,
+            session.cwd.display(),
+            resume_command(session)
+        );
         return Ok(());
     }
     warn_if_missing(session);
@@ -174,7 +181,7 @@ fn load_sessions(
     } else {
         read_cache(cache_path)
     };
-    if old.version != 1 {
+    if old.version != CACHE_VERSION {
         eprintln!("Indexing local history; the first run may take a few seconds...");
     }
     let mut previous = old.entries;
@@ -249,12 +256,12 @@ fn load_sessions(
         .filter_map(|entry| entry.session.clone())
         .collect();
     let sessions = merge_sessions(sessions);
-    if changed > 0 || removed || old.version != 1 {
+    if changed > 0 || removed || old.version != CACHE_VERSION {
         let write_started = Instant::now();
         write_cache(
             cache_path,
             &Cache {
-                version: 1,
+                version: CACHE_VERSION,
                 entries: next,
             },
         )?;
@@ -312,7 +319,7 @@ fn read_cache(path: &Path) -> Cache {
         return Cache::default();
     };
     match serde_json::from_slice::<Cache>(&bytes) {
-        Ok(cache) if cache.version == 1 => cache,
+        Ok(cache) if cache.version == CACHE_VERSION => cache,
         _ => Cache::default(),
     }
 }
@@ -355,6 +362,9 @@ fn choose(sessions: &[Session], fuzzy: bool) -> io::Result<Option<(usize, Select
         "--height=90%",
         "--prompt=Sessions> ",
         "--header=Enter: copy • Ctrl-O: Codex GUI • Esc: close • Codex*: archived",
+        "--preview=printf 'PWD: %s\\nID: %s\\n\\nPreview: %s\\n' {5} {6} {3}",
+        "--preview-window=down,7,wrap",
+        "--preview-label=Selected session",
     ]);
     if !fuzzy {
         picker.args(["--exact", "--no-extended"]);
@@ -599,5 +609,14 @@ mod tests {
         session.source = Source::Codex;
         session.id = "../new".into();
         assert!(gui_url(&session).is_err());
+    }
+
+    #[test]
+    fn rejects_old_cache_after_parser_policy_changes() {
+        let path =
+            std::env::temp_dir().join(format!("session-cache-version-{}.json", std::process::id()));
+        fs::write(&path, r#"{"version":1,"entries":{}}"#).unwrap();
+        assert_eq!(read_cache(&path).version, 0);
+        fs::remove_file(path).unwrap();
     }
 }
