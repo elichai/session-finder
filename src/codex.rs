@@ -1,11 +1,51 @@
 use crate::{Session, Source};
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use std::{
+    borrow::Cow,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
+
+#[derive(Deserialize)]
+struct CodexRecord<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<&'a RawValue>,
+    #[serde(borrow)]
+    payload: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct SessionMeta<'a> {
+    #[serde(borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    cwd: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    thread_source: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct ResponseItem<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    role: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    content: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct ContentBlock<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    text: Option<Cow<'a, str>>,
+}
 
 #[cfg(test)]
 pub fn scan(root: &Path) -> Vec<Session> {
@@ -62,48 +102,65 @@ pub fn parse_file(path: &Path) -> Option<Session> {
 
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { continue };
-        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+        let Ok(record) = serde_json::from_str::<CodexRecord<'_>>(&line) else {
             continue;
         };
-        if let Some(timestamp) = record.get("timestamp").and_then(Value::as_str) {
-            if let Some(timestamp) = parse_timestamp(timestamp) {
+        if let Some(raw) = record.timestamp {
+            if let Some(timestamp) = serde_json::from_str::<Cow<'_, str>>(raw.get())
+                .ok()
+                .and_then(|text| parse_timestamp(&text))
+            {
                 updated = Some(updated.map_or(timestamp, |latest: i64| latest.max(timestamp)));
             }
         }
-        if record.get("type").and_then(Value::as_str) == Some("session_meta") {
-            let Some(meta) = record.get("payload") else {
+        if record.kind.as_deref() == Some("session_meta") {
+            let Some(payload) = record.payload else {
                 continue;
             };
+            let Ok(meta) = serde_json::from_str::<SessionMeta<'_>>(payload.get()) else {
+                continue;
+            };
+            let thread_source = meta
+                .thread_source
+                .and_then(|raw| serde_json::from_str::<Cow<'_, str>>(raw.get()).ok());
             if matches!(
-                meta.get("thread_source").and_then(Value::as_str),
+                thread_source.as_deref(),
                 Some("guardian_review" | "subagent")
             ) {
                 return None;
             }
-            let Some(meta_id) = meta.get("id").and_then(Value::as_str) else {
+            let Some(meta_id) = meta.id else {
                 continue;
             };
-            let Some(meta_cwd) = meta.get("cwd").and_then(Value::as_str) else {
+            let Some(meta_cwd) = meta.cwd else {
                 continue;
             };
-            if !is_uuid(meta_id) || meta_cwd.is_empty() {
+            if !is_uuid(&meta_id) || meta_cwd.is_empty() {
                 continue;
             }
-            id = Some(meta_id.to_owned());
-            cwd = Some(PathBuf::from(meta_cwd));
-        } else if record.get("type").and_then(Value::as_str) == Some("response_item") {
-            let Some(payload) = record.get("payload") else {
+            id = Some(meta_id.into_owned());
+            cwd = Some(PathBuf::from(meta_cwd.into_owned()));
+        } else if record.kind.as_deref() == Some("response_item") {
+            let Some(payload) = record.payload else {
                 continue;
             };
-            if payload.get("type").and_then(Value::as_str) != Some("message")
-                || payload.get("role").and_then(Value::as_str) != Some("user")
+            let Ok(payload) = serde_json::from_str::<ResponseItem<'_>>(payload.get()) else {
+                continue;
+            };
+            if payload.kind.as_deref() != Some("message") || payload.role.as_deref() != Some("user")
             {
                 continue;
             }
-            if let Some(blocks) = payload.get("content").and_then(Value::as_array) {
-                for block in blocks {
-                    if block.get("type").and_then(Value::as_str) == Some("input_text") {
-                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            if let Some(blocks) = payload
+                .content
+                .and_then(|raw| serde_json::from_str::<Vec<&RawValue>>(raw.get()).ok())
+            {
+                for raw in blocks {
+                    let Ok(block) = serde_json::from_str::<ContentBlock<'_>>(raw.get()) else {
+                        continue;
+                    };
+                    if block.kind.as_deref() == Some("input_text") {
+                        if let Some(text) = block.text {
                             let candidate = text.trim_start();
                             // Codex records injected context as user-role messages.
                             if candidate.starts_with("# AGENTS.md instructions for ")
@@ -118,7 +175,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
                             if !search_text.is_empty() {
                                 search_text.push('\n');
                             }
-                            search_text.push_str(text);
+                            search_text.push_str(&text);
                         }
                     }
                 }
@@ -224,6 +281,15 @@ mod tests {
         writeln!(file, r#"{{"type":"response_item","timestamp":"2026-01-02T03:04:05.000Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"<external_codex_apps_open_page>internal</external_codex_apps_open_page>"}}]}}}}"#).unwrap();
         writeln!(file, r#"{{"type":"response_item","timestamp":"2026-01-02T03:04:05.000Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"<wallet>real request</wallet>"}}]}}}}"#).unwrap();
         writeln!(file, r#"{{"type":"response_item","timestamp":"2026-01-02T03:04:06.000Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"fixture query"}}]}}}}"#).unwrap();
+        let mixed = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [
+                7,
+                {"type": "image", "text": "ignore"},
+                {"type": "input_text", "text": "quote \" and slash \\"}
+            ]}
+        });
+        writeln!(file, "{mixed}").unwrap();
         writeln!(file, "not json").unwrap();
 
         let found = scan(&root);
@@ -232,7 +298,7 @@ mod tests {
         assert_eq!(found[0].cwd, PathBuf::from("/tmp/project"));
         assert_eq!(
             found[0].search_text,
-            "<wallet>real request</wallet>\nfixture query"
+            "<wallet>real request</wallet>\nfixture query\nquote \" and slash \\"
         );
         assert_eq!(found[0].preview, "<wallet>real request</wallet>");
         assert_eq!(
@@ -263,6 +329,16 @@ mod tests {
             fs::write(&path, format!("{record}\n")).unwrap();
             assert_eq!(parse_file(&path).is_some(), expected, "{kind}");
         }
+        let malformed_source = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "019c675d-0e41-7f71-925f-1ccc0da0f692",
+                "cwd": "/tmp/project",
+                "thread_source": 7
+            }
+        });
+        fs::write(&path, format!("{malformed_source}\n")).unwrap();
+        assert!(parse_file(&path).is_some());
         fs::remove_file(path).unwrap();
     }
 }

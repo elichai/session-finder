@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u8 = 2;
+const CACHE_VERSION: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Source {
@@ -615,7 +615,7 @@ mod tests {
     fn rejects_old_cache_after_parser_policy_changes() {
         let path =
             std::env::temp_dir().join(format!("session-cache-version-{}.json", std::process::id()));
-        fs::write(&path, r#"{"version":1,"entries":{}}"#).unwrap();
+        fs::write(&path, r#"{"version":2,"entries":{}}"#).unwrap();
         assert_eq!(read_cache(&path).version, 0);
         fs::remove_file(path).unwrap();
     }

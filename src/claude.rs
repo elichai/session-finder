@@ -1,9 +1,39 @@
 use super::{Session, Source};
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::value::RawValue;
+use std::borrow::Cow;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+
+#[derive(Deserialize)]
+struct ClaudeRow<'a> {
+    #[serde(rename = "sessionId", borrow)]
+    session_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    cwd: Option<&'a RawValue>,
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<&'a RawValue>,
+    #[serde(borrow)]
+    message: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeMessage<'a> {
+    #[serde(borrow)]
+    content: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeTextBlock<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    text: Option<Cow<'a, str>>,
+}
 
 #[cfg(test)]
 pub fn scan(root: &Path) -> Vec<Session> {
@@ -61,30 +91,36 @@ pub fn parse_file(path: &Path) -> Option<Session> {
     let mut genuine = false;
     for line in BufReader::new(file).split(b'\n') {
         let Ok(line) = line else { continue };
-        let Ok(row) = serde_json::from_slice::<Value>(&line) else {
+        let Ok(row) = serde_json::from_slice::<ClaudeRow<'_>>(&line) else {
             continue;
         };
-        if row.get("sessionId").and_then(Value::as_str) != Some(id.as_str()) {
+        if row.session_id.as_deref() != Some(id.as_str()) {
             continue;
         }
-        if let Some(dir) = row.get("cwd").and_then(Value::as_str) {
-            cwd.get_or_insert_with(|| PathBuf::from(dir));
+        if let Some(dir) = row
+            .cwd
+            .and_then(|raw| serde_json::from_str::<Cow<'_, str>>(raw.get()).ok())
+        {
+            cwd.get_or_insert_with(|| PathBuf::from(dir.as_ref()));
         }
         if let Some(ts) = row
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_timestamp)
+            .timestamp
+            .and_then(|raw| serde_json::from_str::<Cow<'_, str>>(raw.get()).ok())
+            .and_then(|text| parse_timestamp(&text))
         {
             updated = updated.max(ts);
         }
-        if row.get("type").and_then(Value::as_str) != Some("user") {
+        if row.kind.as_deref() != Some("user") {
             continue;
         }
         genuine = true;
-        let Some(message) = row.get("message") else {
+        let Some(message) = row.message else {
             continue;
         };
-        if let Some(text) = user_text(message.get("content")) {
+        let Ok(message) = serde_json::from_str::<ClaudeMessage<'_>>(message.get()) else {
+            continue;
+        };
+        if let Some(text) = user_text(message.content) {
             if !text.trim().is_empty() {
                 if preview.is_empty() {
                     preview = text.chars().take(240).collect();
@@ -120,23 +156,29 @@ pub fn parse_file(path: &Path) -> Option<Session> {
     })
 }
 
-fn user_text(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(parts) => {
-            let text = parts
-                .iter()
-                .filter_map(|part| {
-                    (part.get("type").and_then(Value::as_str) == Some("text"))
-                        .then(|| part.get("text").and_then(Value::as_str))
-                        .flatten()
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            Some(text)
-        }
-        _ => None,
+fn user_text(value: Option<&RawValue>) -> Option<String> {
+    let raw = value?.get();
+    if let Ok(text) = serde_json::from_str::<Cow<'_, str>>(raw) {
+        return Some(text.into_owned());
     }
+    let parts = serde_json::from_str::<Vec<&RawValue>>(raw).ok()?;
+    let mut text = String::new();
+    let mut first = true;
+    for part in parts {
+        let Ok(part) = serde_json::from_str::<ClaudeTextBlock<'_>>(part.get()) else {
+            continue;
+        };
+        if part.kind.as_deref() == Some("text") {
+            if let Some(content) = part.text {
+                if !first {
+                    text.push(' ');
+                }
+                first = false;
+                text.push_str(&content);
+            }
+        }
+    }
+    Some(text)
 }
 
 // Claude timestamps are RFC3339. Convert UTC calendar dates without a date crate.
@@ -223,5 +265,58 @@ mod tests {
         assert_eq!(found[0].cwd, PathBuf::from("/work"));
         assert_eq!(found[0].search_text, "find this phrase");
         assert_eq!(found[0].updated, 1_735_787_045);
+    }
+
+    #[test]
+    fn reads_escaped_string_and_mixed_content_blocks() {
+        let root = std::env::temp_dir().join(format!(
+            "claude-content-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let first = serde_json::json!({
+            "type": "user",
+            "sessionId": id,
+            "cwd": "/tmp/O'Brien\\work",
+            "timestamp": "2025-01-02T03:04:05.000Z",
+            "message": {"content": "quote \" and slash \\"}
+        });
+        let second = serde_json::json!({
+            "type": "user",
+            "sessionId": id,
+            "message": {"content": [
+                {"type": "image", "text": "ignore"},
+                7,
+                {"type": "text", "text": "alpha"},
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "β"}
+            ]}
+        });
+        let malformed_cwd = serde_json::json!({
+            "type": "user",
+            "sessionId": id,
+            "cwd": 7,
+            "message": {"content": "keep despite bad cwd"}
+        });
+        fs::write(
+            root.join(format!("{id}.jsonl")),
+            format!("{first}\n{second}\n{malformed_cwd}\n"),
+        )
+        .unwrap();
+
+        let found = scan(&root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].cwd, PathBuf::from("/tmp/O'Brien\\work"));
+        assert_eq!(
+            found[0].search_text,
+            "quote \" and slash \\\nalpha  β\nkeep despite bad cwd"
+        );
+        assert_eq!(found[0].preview, "quote \" and slash \\");
+        fs::remove_dir_all(root).unwrap();
     }
 }
