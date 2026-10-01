@@ -1,7 +1,6 @@
-use super::{Session, Source};
+use super::{BorrowedStr, Session, Source};
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use std::borrow::Cow;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -10,11 +9,11 @@ use std::time::UNIX_EPOCH;
 #[derive(Deserialize)]
 struct ClaudeRow<'a> {
     #[serde(rename = "sessionId", borrow)]
-    session_id: Option<Cow<'a, str>>,
+    session_id: Option<BorrowedStr<'a>>,
     #[serde(borrow)]
     cwd: Option<&'a RawValue>,
     #[serde(rename = "type", borrow)]
-    kind: Option<Cow<'a, str>>,
+    kind: Option<BorrowedStr<'a>>,
     #[serde(borrow)]
     timestamp: Option<&'a RawValue>,
     #[serde(borrow)]
@@ -30,9 +29,9 @@ struct ClaudeMessage<'a> {
 #[derive(Deserialize)]
 struct ClaudeTextBlock<'a> {
     #[serde(rename = "type", borrow)]
-    kind: Option<Cow<'a, str>>,
+    kind: Option<BorrowedStr<'a>>,
     #[serde(borrow)]
-    text: Option<Cow<'a, str>>,
+    text: Option<BorrowedStr<'a>>,
 }
 
 #[cfg(test)]
@@ -99,13 +98,13 @@ pub fn parse_file(path: &Path) -> Option<Session> {
         }
         if let Some(dir) = row
             .cwd
-            .and_then(|raw| serde_json::from_str::<Cow<'_, str>>(raw.get()).ok())
+            .and_then(|raw| serde_json::from_str::<BorrowedStr<'_>>(raw.get()).ok())
         {
-            cwd.get_or_insert_with(|| PathBuf::from(dir.as_ref()));
+            cwd.get_or_insert_with(|| PathBuf::from(&*dir));
         }
         if let Some(ts) = row
             .timestamp
-            .and_then(|raw| serde_json::from_str::<Cow<'_, str>>(raw.get()).ok())
+            .and_then(|raw| serde_json::from_str::<BorrowedStr<'_>>(raw.get()).ok())
             .and_then(|text| parse_timestamp(&text))
         {
             updated = updated.max(ts);
@@ -158,8 +157,8 @@ pub fn parse_file(path: &Path) -> Option<Session> {
 
 fn user_text(value: Option<&RawValue>) -> Option<String> {
     let raw = value?.get();
-    if let Ok(text) = serde_json::from_str::<Cow<'_, str>>(raw) {
-        return Some(text.into_owned());
+    if let Ok(text) = serde_json::from_str::<BorrowedStr<'_>>(raw) {
+        return Some(text.0.into_owned());
     }
     let parts = serde_json::from_str::<Vec<&RawValue>>(raw).ok()?;
     let mut text = String::new();
@@ -241,6 +240,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
 
     #[test]
     fn scans_conversation_and_ignores_sidecar_and_bad_lines() {
@@ -286,6 +286,15 @@ mod tests {
             "timestamp": "2025-01-02T03:04:05.000Z",
             "message": {"content": "quote \" and slash \\"}
         });
+        let first_json = first.to_string();
+        let parsed: ClaudeRow<'_> = serde_json::from_str(&first_json).unwrap();
+        assert!(matches!(
+            parsed.kind,
+            Some(BorrowedStr(Cow::Borrowed("user")))
+        ));
+        assert!(
+            matches!(parsed.session_id, Some(BorrowedStr(Cow::Borrowed(value))) if value == id)
+        );
         let second = serde_json::json!({
             "type": "user",
             "sessionId": id,

@@ -2,6 +2,7 @@ mod claude;
 mod codex;
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -16,6 +17,17 @@ const CACHE_VERSION: u8 = 3;
 pub enum Source {
     Claude,
     Codex,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BorrowedStr<'a>(#[serde(borrow)] pub(crate) Cow<'a, str>);
+
+impl std::ops::Deref for BorrowedStr<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -618,5 +630,26 @@ mod tests {
         fs::write(&path, r#"{"version":2,"entries":{}}"#).unwrap();
         assert_eq!(read_cache(&path).version, 0);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn optional_strings_borrow_unescaped_json() {
+        #[derive(Deserialize)]
+        struct Field<'a> {
+            #[serde(borrow)]
+            value: Option<BorrowedStr<'a>>,
+        }
+
+        let plain: Field<'_> = serde_json::from_str(r#"{"value":"plain"}"#).unwrap();
+        assert!(matches!(
+            plain.value,
+            Some(BorrowedStr(Cow::Borrowed("plain")))
+        ));
+        let escaped: Field<'_> = serde_json::from_str(r#"{"value":"a\"b"}"#).unwrap();
+        assert!(matches!(escaped.value, Some(BorrowedStr(Cow::Owned(value))) if value == "a\"b"));
+        let missing: Field<'_> = serde_json::from_str("{}").unwrap();
+        assert!(missing.value.is_none());
+        let direct: BorrowedStr<'_> = serde_json::from_str(r#""plain""#).unwrap();
+        assert!(matches!(direct, BorrowedStr(Cow::Borrowed("plain"))));
     }
 }

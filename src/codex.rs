@@ -1,8 +1,7 @@
-use crate::{Session, Source};
+use crate::{BorrowedStr, Session, Source};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::{
-    borrow::Cow,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -12,7 +11,7 @@ use std::{
 #[derive(Deserialize)]
 struct CodexRecord<'a> {
     #[serde(rename = "type", borrow)]
-    kind: Option<Cow<'a, str>>,
+    kind: Option<BorrowedStr<'a>>,
     #[serde(borrow)]
     timestamp: Option<&'a RawValue>,
     #[serde(borrow)]
@@ -22,9 +21,9 @@ struct CodexRecord<'a> {
 #[derive(Deserialize)]
 struct SessionMeta<'a> {
     #[serde(borrow)]
-    id: Option<Cow<'a, str>>,
+    id: Option<BorrowedStr<'a>>,
     #[serde(borrow)]
-    cwd: Option<Cow<'a, str>>,
+    cwd: Option<BorrowedStr<'a>>,
     #[serde(borrow)]
     thread_source: Option<&'a RawValue>,
 }
@@ -32,9 +31,9 @@ struct SessionMeta<'a> {
 #[derive(Deserialize)]
 struct ResponseItem<'a> {
     #[serde(rename = "type", borrow)]
-    kind: Option<Cow<'a, str>>,
+    kind: Option<BorrowedStr<'a>>,
     #[serde(borrow)]
-    role: Option<Cow<'a, str>>,
+    role: Option<BorrowedStr<'a>>,
     #[serde(borrow)]
     content: Option<&'a RawValue>,
 }
@@ -42,9 +41,9 @@ struct ResponseItem<'a> {
 #[derive(Deserialize)]
 struct ContentBlock<'a> {
     #[serde(rename = "type", borrow)]
-    kind: Option<Cow<'a, str>>,
+    kind: Option<BorrowedStr<'a>>,
     #[serde(borrow)]
-    text: Option<Cow<'a, str>>,
+    text: Option<BorrowedStr<'a>>,
 }
 
 #[cfg(test)]
@@ -106,7 +105,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
             continue;
         };
         if let Some(raw) = record.timestamp {
-            if let Some(timestamp) = serde_json::from_str::<Cow<'_, str>>(raw.get())
+            if let Some(timestamp) = serde_json::from_str::<BorrowedStr<'_>>(raw.get())
                 .ok()
                 .and_then(|text| parse_timestamp(&text))
             {
@@ -122,7 +121,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
             };
             let thread_source = meta
                 .thread_source
-                .and_then(|raw| serde_json::from_str::<Cow<'_, str>>(raw.get()).ok());
+                .and_then(|raw| serde_json::from_str::<BorrowedStr<'_>>(raw.get()).ok());
             if matches!(
                 thread_source.as_deref(),
                 Some("guardian_review" | "subagent")
@@ -138,8 +137,8 @@ pub fn parse_file(path: &Path) -> Option<Session> {
             if !is_uuid(&meta_id) || meta_cwd.is_empty() {
                 continue;
             }
-            id = Some(meta_id.into_owned());
-            cwd = Some(PathBuf::from(meta_cwd.into_owned()));
+            id = Some(meta_id.0.into_owned());
+            cwd = Some(PathBuf::from(meta_cwd.0.into_owned()));
         } else if record.kind.as_deref() == Some("response_item") {
             let Some(payload) = record.payload else {
                 continue;
@@ -267,6 +266,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use std::io::Write;
 
     #[test]
@@ -289,6 +289,18 @@ mod tests {
                 {"type": "input_text", "text": "quote \" and slash \\"}
             ]}
         });
+        let mixed_json = mixed.to_string();
+        let record: CodexRecord<'_> = serde_json::from_str(&mixed_json).unwrap();
+        assert!(matches!(
+            record.kind,
+            Some(BorrowedStr(Cow::Borrowed("response_item")))
+        ));
+        let payload: ResponseItem<'_> =
+            serde_json::from_str(record.payload.unwrap().get()).unwrap();
+        assert!(matches!(
+            payload.role,
+            Some(BorrowedStr(Cow::Borrowed("user")))
+        ));
         writeln!(file, "{mixed}").unwrap();
         writeln!(file, "not json").unwrap();
 
