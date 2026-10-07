@@ -1,11 +1,12 @@
 mod claude;
 mod codex;
+mod cursor;
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,6 +18,7 @@ const CACHE_VERSION: u8 = 3;
 pub enum Source {
     Claude,
     Codex,
+    Cursor,
 }
 
 #[derive(Deserialize)]
@@ -71,7 +73,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --rebuild]\n\nOpen a recent-first search panel of local Claude and Codex sessions.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nEnter copies and prints the exact resume command. Ctrl-O opens a Codex chat in the GUI. Esc cancels.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.");
+        println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\nSearch local Claude, Codex, and Cursor sessions, most recent first.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nEnter copies the exact resume command. Ctrl-O opens the selected session in its app. Esc cancels.\nCursor opening requires the local Session Finder helper extension.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\nSESSION_FINDER_CURSOR_DB overrides Cursor's local history database.");
         return Ok(());
     }
     let rebuild = args.iter().any(|arg| arg == "--rebuild");
@@ -80,15 +82,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let print_id = args
         .iter()
         .position(|arg| arg == "--print")
-        .and_then(|i| args.get(i + 1));
+        .and_then(|i| args.get(i + 1))
+        .filter(|id| !id.starts_with('-'));
+    let open_id = args
+        .iter()
+        .position(|arg| arg == "--open")
+        .and_then(|i| args.get(i + 1))
+        .filter(|id| !id.starts_with('-'));
+    if args
+        .iter()
+        .filter(|arg| matches!(arg.as_str(), "--list" | "--print" | "--open"))
+        .count()
+        > 1
+    {
+        return Err("choose one of --list, --print, or --open".into());
+    }
     if args.iter().any(|arg| {
-        !matches!(arg.as_str(), "--list" | "--print" | "--rebuild" | "--fuzzy")
-            && Some(arg) != print_id
+        !matches!(
+            arg.as_str(),
+            "--list" | "--print" | "--open" | "--rebuild" | "--fuzzy"
+        ) && Some(arg) != print_id
+            && Some(arg) != open_id
     }) {
         return Err("unknown argument; use --help".into());
     }
-    if args.iter().any(|arg| arg == "--print") && print_id.is_none() {
-        return Err("--print needs a session ID".into());
+    if (args.iter().any(|arg| arg == "--print") && print_id.is_none())
+        || (args.iter().any(|arg| arg == "--open") && open_id.is_none())
+    {
+        return Err("--print and --open need a session ID".into());
     }
 
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is unset")?);
@@ -104,10 +125,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cache_path = std::env::var_os("SESSION_FINDER_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".cache/session-finder/index.json"));
+    let cursor_db = std::env::var_os("SESSION_FINDER_CURSOR_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        });
     let sessions = load_sessions(
         &claude_root,
         &codex_root,
         &codex_archive_root,
+        &cursor_db,
         &cache_path,
         rebuild,
     )?;
@@ -124,7 +151,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    if let Some(id) = print_id {
+    if let Some(id) = print_id.or(open_id) {
         let matches: Vec<_> = sessions
             .iter()
             .filter(|session| session.id == *id)
@@ -132,30 +159,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if matches.len() != 1 {
             return Err(format!("expected one session for {id}, found {}", matches.len()).into());
         }
+        if open_id.is_some() {
+            return open_gui(matches[0]);
+        }
         warn_if_missing(matches[0]);
         println!("{}", resume_command(matches[0]));
         return Ok(());
     }
     if sessions.is_empty() {
-        return Err("no Claude or Codex sessions found".into());
+        return Err("no Claude, Codex, or Cursor sessions found".into());
     }
     let Some((selected, action)) = choose(&sessions, fuzzy)? else {
         return Ok(());
     };
     let session = &sessions[selected];
     if action == SelectionAction::OpenGui {
-        let url = gui_url(session)?;
-        let status = Command::new("open").arg(&url).status()?;
-        if !status.success() {
-            return Err(format!("could not open Codex GUI: {status}").into());
-        }
-        println!(
-            "Sent Codex chat {} to the GUI. PWD: {}\nIf it did not switch chats, run: {}",
-            session.id,
-            session.cwd.display(),
-            resume_command(session)
-        );
-        return Ok(());
+        return open_gui(session);
     }
     warn_if_missing(session);
     let command = resume_command(session);
@@ -183,6 +202,7 @@ fn load_sessions(
     claude_root: &Path,
     codex_root: &Path,
     codex_archive_root: &Path,
+    cursor_db: &Path,
     cache_path: &Path,
     rebuild: bool,
 ) -> io::Result<Vec<Session>> {
@@ -263,10 +283,14 @@ fn load_sessions(
         next.insert(key, entry);
     }
     let removed = !previous.is_empty();
-    let sessions: Vec<Session> = next
+    let mut sessions: Vec<Session> = next
         .values()
         .filter_map(|entry| entry.session.clone())
         .collect();
+    match cursor::scan(cursor_db) {
+        Ok(cursor_sessions) => sessions.extend(cursor_sessions),
+        Err(error) => eprintln!("Could not read Cursor history: {error}"),
+    }
     let sessions = merge_sessions(sessions);
     if changed > 0 || removed || old.version != CACHE_VERSION {
         let write_started = Instant::now();
@@ -373,7 +397,7 @@ fn choose(sessions: &[Session], fuzzy: bool) -> io::Result<Option<(usize, Select
         "--border",
         "--height=90%",
         "--prompt=Sessions> ",
-        "--header=Enter: copy • Ctrl-O: Codex GUI • Esc: close • Codex*: archived",
+        "--header=Enter: copy • Ctrl-O: open app • Esc: close • *: archived",
         "--preview=printf 'PWD: %s\\nID: %s\\n\\nPreview: %s\\n' {5} {6} {3}",
         "--preview-window=down,7,wrap",
         "--preview-label=Selected session",
@@ -394,7 +418,7 @@ fn choose(sessions: &[Session], fuzzy: bool) -> io::Result<Option<(usize, Select
             let search_text = clean(&session.search_text, usize::MAX);
             if writeln!(
                 stdin,
-                "{i}\t{age:>8}  {:<6}  {cwd:<28}\t{preview:<60}\t{search_text}\t{}\t{}",
+                "{i}\t{age:>8}  {:<7}  {cwd:<28}\t{preview:<60}\t{search_text}\t{}\t{}",
                 display_source(session),
                 full_cwd,
                 session.id
@@ -431,28 +455,86 @@ fn parse_selection(output: &[u8], count: usize) -> io::Result<(usize, SelectionA
     Ok((index, action))
 }
 
-fn gui_url(session: &Session) -> Result<String, &'static str> {
-    if session.source != Source::Codex {
-        return Err("Codex GUI can only open Codex sessions");
-    }
+fn gui_command(session: &Session) -> Result<Command, &'static str> {
     if !codex::is_uuid(&session.id) {
-        return Err("Codex session has an invalid ID");
+        return Err("session has an invalid ID");
     }
-    Ok(format!("codex://threads/{}", session.id))
+    let mut command = match session.source {
+        Source::Claude => Command::new("claude"),
+        Source::Codex | Source::Cursor => Command::new("open"),
+    };
+    match session.source {
+        Source::Claude => {
+            command
+                .current_dir(&session.cwd)
+                .args(["--desktop", "--resume", &session.id]);
+        }
+        Source::Codex => {
+            command.arg(format!("codex://threads/{}", session.id));
+        }
+        Source::Cursor => {
+            command.arg(cursor_url(session));
+        }
+    }
+    Ok(command)
+}
+
+fn open_gui(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_missing(session);
+    let mut command = gui_command(session)?;
+    if session.source == Source::Claude && !io::stdout().is_terminal() {
+        // Claude's desktop handoff rejects redirected output, including CLI wrappers.
+        let terminal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .map_err(|_| "Claude Desktop opening requires a terminal")?;
+        command.stdout(terminal.try_clone()?).stderr(terminal);
+    }
+    let status = command.status()?;
+    if !status.success() {
+        return Err(format!("could not open {}: {status}", source_name(session.source)).into());
+    }
+    println!(
+        "Requested {} session {} in its app. PWD: {}",
+        source_name(session.source),
+        session.id,
+        session.cwd.display()
+    );
+    Ok(())
+}
+
+fn cursor_url(session: &Session) -> String {
+    let mut url = String::from("cursor://session-finder.cursor-session-opener/open?id=");
+    url.push_str(&session.id);
+    url.push_str("&cwd=");
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &byte in session.cwd.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            url.push(char::from(byte));
+        } else {
+            url.push('%');
+            url.push(char::from(HEX[usize::from(byte >> 4)]));
+            url.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    url
 }
 
 fn source_name(source: Source) -> &'static str {
     match source {
         Source::Claude => "Claude",
         Source::Codex => "Codex",
+        Source::Cursor => "Cursor",
     }
 }
 
 fn display_source(session: &Session) -> &'static str {
-    if session.archived {
-        "Codex*"
-    } else {
-        source_name(session.source)
+    match (session.source, session.archived) {
+        (Source::Claude, true) => "Claude*",
+        (Source::Codex, true) => "Codex*",
+        (Source::Cursor, true) => "Cursor*",
+        (source, false) => source_name(source),
     }
 }
 
@@ -512,6 +594,7 @@ fn resume_command(session: &Session) -> String {
     match session.source {
         Source::Claude => format!("cd -- {cwd} && claude --resume {id}"),
         Source::Codex => format!("codex resume {id} -C {cwd}"),
+        Source::Cursor => ["open ", &shell_quote(&cursor_url(session))].concat(),
     }
 }
 
@@ -602,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn gui_link_targets_only_codex_sessions() {
+    fn gui_commands_target_exact_sessions_without_a_shell() {
         let mut session = Session {
             source: Source::Codex,
             id: "019c675d-0e41-7f71-925f-1ccc0da0f692".into(),
@@ -612,15 +695,34 @@ mod tests {
             preview: String::new(),
             archived: false,
         };
+        let command = gui_command(&session).unwrap();
+        assert_eq!(command.get_program(), "open");
         assert_eq!(
-            gui_url(&session).unwrap(),
-            "codex://threads/019c675d-0e41-7f71-925f-1ccc0da0f692"
+            command.get_args().collect::<Vec<_>>(),
+            ["codex://threads/019c675d-0e41-7f71-925f-1ccc0da0f692"]
         );
         session.source = Source::Claude;
-        assert!(gui_url(&session).is_err());
-        session.source = Source::Codex;
+        session.cwd = "/tmp/O'Brien; echo bad".into();
+        let command = gui_command(&session).unwrap();
+        assert_eq!(command.get_program(), "claude");
+        assert_eq!(command.get_current_dir(), Some(session.cwd.as_path()));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--desktop", "--resume", &session.id]
+        );
+        session.source = Source::Cursor;
+        let command = gui_command(&session).unwrap();
+        assert_eq!(command.get_program(), "open");
+        let url = cursor_url(&session);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new(&url)]
+        );
+        assert_eq!(resume_command(&session), "open 'cursor://session-finder.cursor-session-opener/open?id=019c675d-0e41-7f71-925f-1ccc0da0f692&cwd=%2Ftmp%2FO%27Brien%3B%20echo%20bad'");
+        session.cwd = "/tmp/é?&#".into();
+        assert!(cursor_url(&session).ends_with("cwd=%2Ftmp%2F%C3%A9%3F%26%23"));
         session.id = "../new".into();
-        assert!(gui_url(&session).is_err());
+        assert!(gui_command(&session).is_err());
     }
 
     #[test]
