@@ -1,0 +1,123 @@
+name: Portable binaries
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    env:
+      TARGET: ${{ matrix.target }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET"
+      - name: Install musl compiler
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+          echo 'CC=musl-gcc' >> "$GITHUB_ENV"
+          linker="CARGO_TARGET_$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
+          echo "$linker=musl-gcc" >> "$GITHUB_ENV"
+      - name: Verify release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          test "$RELEASE_TAG" = "v$version"
+      - name: Build and test release target
+        run: |
+          cargo test --locked --release --target "$TARGET"
+          cargo build --locked --release --target "$TARGET"
+          node --test cursor-extension/extension.test.js
+      - name: Check runtime dependencies
+        shell: bash
+        run: |
+          binary="target/$TARGET/release/session-finder"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            readelf -lW "$binary" > program-headers.txt
+            readelf -dW "$binary" > dynamic-section.txt
+            if grep -q 'INTERP' program-headers.txt || grep -q '(NEEDED)' dynamic-section.txt; then
+              echo 'Linux binary must not require a dynamic loader or shared libraries.' >&2
+              exit 1
+            fi
+          else
+            otool -L "$binary" > dylibs.txt
+            awk 'NR > 1 && $1 !~ /^\/usr\/lib\// && $1 !~ /^\/System\/Library\// { print; bad=1 } END { exit bad }' dylibs.txt
+          fi
+      - name: Smoke test without history or fzf
+        shell: bash
+        env:
+          SESSION_FINDER_CLAUDE_ROOT: /nonexistent/claude
+          SESSION_FINDER_CODEX_ROOT: /nonexistent/codex
+          SESSION_FINDER_CODEX_ARCHIVE_ROOT: /nonexistent/archived
+          SESSION_FINDER_CURSOR_DB: /nonexistent/cursor.db
+        run: |
+          export SESSION_FINDER_CACHE="$RUNNER_TEMP/session-finder/index.json"
+          binary="target/$TARGET/release/session-finder"
+          "$binary" --help
+          "$binary" --list > sessions.txt
+          test ! -s sessions.txt
+      - name: Package
+        run: |
+          mkdir -p dist
+          archive="session-finder-$TARGET.tar.gz"
+          tar -czf "dist/$archive" -C "target/$TARGET/release" session-finder
+          shasum -a 256 "dist/$archive" | sed 's|dist/||' > "dist/$archive.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: session-finder-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: session-finder-*
+          merge-multiple: true
+          path: dist
+      - name: Verify and publish archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          gh release create "$RELEASE_TAG" ./*.tar.gz SHA256SUMS --verify-tag --generate-notes --title "$RELEASE_TAG"
