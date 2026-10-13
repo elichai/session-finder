@@ -38,6 +38,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Test publication tag guard
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: python3 .github/tests/release_tag.py
       - name: Install Rust target
         run: |
           rustup toolchain install stable --profile minimal
@@ -122,4 +125,9 @@ jobs:
           cd dist
           cat ./*.sha256 > SHA256SUMS
           sha256sum --check SHA256SUMS
+          tag_sha=$(gh api "repos/$GH_REPO/commits/refs/tags/$RELEASE_TAG" --jq .sha)
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo 'Release tag no longer points to the commit that produced these archives.' >&2
+            exit 1
+          fi
           gh release create "$RELEASE_TAG" ./*.tar.gz SHA256SUMS --verify-tag --generate-notes --title "$RELEASE_TAG"

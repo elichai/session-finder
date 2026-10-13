@@ -111,9 +111,12 @@ SESSION_FINDER_CACHE=/path/to/private/index.json session-finder
 ## Tests
 
 Run parser tests with `cargo test`, and helper tests with `node --test cursor-extension/extension.test.js`.
+Run the publication guard regression check with `python3 .github/tests/release_tag.py`; it mocks GitHub and never publishes a release.
 
 ## Releasing
 
 The Portable binaries workflow builds and tests all four targets on pull requests and manual runs, then uploads archives as workflow artifacts. Linux checks reject ELF interpreters or shared-library dependencies; macOS checks reject non-system dylibs. No release is published for a pull request or manual branch run.
 
 To publish, merge the release changes, set the version in `Cargo.toml`, update `Cargo.lock` with `cargo check`, and push those changes. Then tag that commit (for example, `git tag v0.1.0` followed by `git push origin v0.1.0`). The tag must match the Cargo version. Once every build passes, the tag run creates a GitHub Release with all four archives and `SHA256SUMS`. Reusing an existing release tag fails instead of replacing published assets.
+
+Before publication, the workflow resolves the current tag (including annotated tags) and requires its commit to match the build's triggering commit. Missing or moved tags abort publication. Repository tag rules must also prohibit updates and deletion for `refs/tags/v*`, with no bypass actors, to close the race between this check and release creation. These rules allow new version tags; corrections use a new version. Forks must configure the same tag rules separately.
