@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     name: ${{ matrix.target }}
@@ -58,7 +62,6 @@ jobs:
           cargo build --locked --release --target "$TARGET"
           node --test cursor-extension/extension.test.js
       - name: Check runtime dependencies
-        shell: bash
         run: |
           binary="target/$TARGET/release/session-finder"
           if [[ "$RUNNER_OS" == Linux ]]; then
@@ -73,7 +76,6 @@ jobs:
             awk 'NR > 1 && $1 !~ /^\/usr\/lib\// && $1 !~ /^\/System\/Library\// { print; bad=1 } END { exit bad }' dylibs.txt
           fi
       - name: Smoke test without history or fzf
-        shell: bash
         env:
           SESSION_FINDER_CLAUDE_ROOT: /nonexistent/claude
           SESSION_FINDER_CODEX_ROOT: /nonexistent/codex
