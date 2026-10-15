@@ -6,21 +6,21 @@ Find a local Claude Code, Codex, or Cursor conversation by its working directory
 
 ## Install
 
-Requires a current stable [Rust toolchain](https://rust-lang.org/tools/install/), system SQLite, and **fzf 0.67.0 or later**. The picker uses `--freeze-left`, added in [fzf 0.67.0](https://github.com/junegunn/fzf/releases/tag/v0.67.0). Install the Claude/Codex CLI to resume those providers in a terminal.
+Requires **fzf 0.67.0 or later**. The picker uses `--freeze-left`, added in [fzf 0.67.0](https://github.com/junegunn/fzf/releases/tag/v0.67.0). SQLite is bundled into the binary; no system SQLite installation is needed. Install the Claude/Codex CLI to resume those providers in a terminal.
 
 ### macOS (Homebrew)
 
 ```sh
-brew install fzf pkgconf sqlite
+brew install fzf
 ```
 
-Rust also needs Apple's command line developer tools; run `xcode-select --install` if they are missing.
+Building from source also requires a current stable [Rust toolchain](https://rust-lang.org/tools/install/) and Apple's command line developer tools; run `xcode-select --install` if they are missing.
 
 ### Linux (Debian / Ubuntu)
 
 ```sh
 sudo apt-get update
-sudo apt-get install fzf build-essential pkg-config libsqlite3-dev
+sudo apt-get install fzf
 fzf --version
 ```
 
@@ -28,7 +28,34 @@ Distribution packages can be older than 0.67.0. If yours is, install a recent bi
 
 Linux supports the Claude/Codex history panel and printed terminal resume commands. Clipboard copying and Codex/Cursor GUI opening currently use macOS tools (`pbcopy` and `open`). The Cursor helper installation instructions below also target macOS. Cursor's default database path is specific to macOS; use `SESSION_FINDER_CURSOR_DB` to point at its database on Linux.
 
-### Install Session Finder
+### Prebuilt binaries
+
+Download the archive for your machine and `SHA256SUMS` from [GitHub Releases](https://github.com/elichai/session-finder/releases). Releases are published when a version tag is pushed; there may be no release until the first tag.
+
+| System | Archive |
+| --- | --- |
+| macOS Intel (11+) | `session-finder-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon (11+) | `session-finder-aarch64-apple-darwin.tar.gz` |
+| Linux x86_64 | `session-finder-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 | `session-finder-aarch64-unknown-linux-musl.tar.gz` |
+
+Linux binaries use static musl and bundled SQLite, so they do not require a matching glibc or a SQLite shared library. macOS binaries use only operating system libraries. The macOS deployment target is 11.0; CI runs on macOS 15, not every supported older OS. macOS archives are not signed or notarized.
+
+For example, on Apple Silicon, from the download directory:
+
+```sh
+shasum -a 256 --ignore-missing -c SHA256SUMS
+tar -xzf session-finder-aarch64-apple-darwin.tar.gz
+mkdir -p ~/.local/bin
+install -m 755 session-finder ~/.local/bin/session-finder
+~/.local/bin/session-finder --help
+```
+
+On Linux, use `sha256sum --ignore-missing -c SHA256SUMS` and choose the Linux archive. Add `~/.local/bin` to your `PATH` if needed. `fzf` remains a separate runtime dependency for the panel.
+
+### Build from source
+
+Requires stable Rust and a C compiler for bundled SQLite. On Debian/Ubuntu, install the compiler with `sudo apt-get install build-essential`.
 
 From the repository directory:
 
@@ -84,3 +111,9 @@ SESSION_FINDER_CACHE=/path/to/private/index.json session-finder
 ## Tests
 
 Run parser tests with `cargo test`, and helper tests with `node --test cursor-extension/extension.test.js`.
+
+## Releasing
+
+The Portable binaries workflow builds and tests all four targets on pull requests and manual runs, then uploads archives as workflow artifacts. Linux checks reject ELF interpreters or shared-library dependencies; macOS checks reject non-system dylibs. No release is published for a pull request or manual branch run.
+
+To publish, merge the release changes, set the version in `Cargo.toml`, update `Cargo.lock` with `cargo check`, and push those changes. Then tag that commit (for example, `git tag v0.1.0` followed by `git push origin v0.1.0`). The tag must match the Cargo version. Once every build passes, the tag run creates a GitHub Release with all four archives and `SHA256SUMS`. Reusing an existing release tag fails instead of replacing published assets.
