@@ -38,19 +38,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Test publication tag guard
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          guard=$(sed -n '/^          tag_sha=/,/^          fi$/p' .github/workflows/release.yml)
-          test -n "$guard"
-          gh() { printf '%s\n' "$TAG_SHA"; return "${API_STATUS:-0}"; }
-          export -f gh
-          export GITHUB_SHA=expected
-          TAG_SHA=expected bash -e -c "$guard"
-          for sha in moved ''; do
-            if TAG_SHA="$sha" bash -e -c "$guard"; then exit 1; fi
-          done
-          if TAG_SHA=expected API_STATUS=1 bash -e -c "$guard"; then exit 1; fi
       - name: Install Rust target
         run: |
           rustup toolchain install stable --profile minimal
@@ -135,9 +122,4 @@ jobs:
           cd dist
           cat ./*.sha256 > SHA256SUMS
           sha256sum --check SHA256SUMS
-          tag_sha=$(gh api "repos/$GH_REPO/commits/refs/tags/$RELEASE_TAG" --jq .sha)
-          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-            echo 'Release tag no longer points to the commit that produced these archives.' >&2
-            exit 1
-          fi
           gh release create "$RELEASE_TAG" ./*.tar.gz SHA256SUMS --verify-tag --generate-notes --title "$RELEASE_TAG"
