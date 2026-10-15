@@ -111,7 +111,6 @@ SESSION_FINDER_CACHE=/path/to/private/index.json session-finder
 ## Tests
 
 Run parser tests with `cargo test`, and helper tests with `node --test cursor-extension/extension.test.js`.
-Run the publication guard regression check with `python3 .github/tests/release_tag.py`; it mocks GitHub and never publishes a release.
 
 ## Releasing
 
