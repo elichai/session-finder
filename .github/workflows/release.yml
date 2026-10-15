@@ -122,4 +122,8 @@ jobs:
           cd dist
           cat ./*.sha256 > SHA256SUMS
           sha256sum --check SHA256SUMS
-          gh release create "$RELEASE_TAG" ./*.tar.gz SHA256SUMS --verify-tag --generate-notes --title "$RELEASE_TAG"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" ./*.tar.gz SHA256SUMS
+          else
+            gh release create "$RELEASE_TAG" ./*.tar.gz SHA256SUMS --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi
