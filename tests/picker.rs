@@ -55,9 +55,9 @@ fn refresh_rows_discover_changed_new_and_deleted_sessions() {
         )
         .unwrap()
     };
-    let rows = || {
+    let run = |args: &[&str]| {
         let output = Command::new(env!("CARGO_BIN_EXE_session-finder"))
-            .arg("--picker-rows")
+            .args(args)
             .env("SESSION_FINDER_CLAUDE_ROOT", &root)
             .env("SESSION_FINDER_CODEX_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CODEX_ARCHIVE_ROOT", root.join("missing"))
@@ -72,10 +72,18 @@ fn refresh_rows_discover_changed_new_and_deleted_sessions() {
         );
         String::from_utf8(output.stdout).unwrap()
     };
+    let rows = || run(&["--picker-rows"]);
     assert!(rows().is_empty());
     write("first request");
     let before = rows();
     assert!(before.contains("first request"));
+    let listed = run(&["--fuzzy", "--list", "--rebuild"]);
+    assert_eq!(listed.lines().count(), 1);
+    assert!(listed.contains("Claude\t123e4567-e89b-12d3-a456-426614174000\t/work\tfirst request"));
+    assert_eq!(
+        run(&["--print", "123e4567-e89b-12d3-a456-426614174000", "--fuzzy"]),
+        "cd -- '/work' && claude --resume '123e4567-e89b-12d3-a456-426614174000'\n"
+    );
     write("changed request with more text");
     let after = rows();
     assert!(after.contains("changed request with more text"));

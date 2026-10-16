@@ -102,6 +102,8 @@ The Claude/Codex index is saved at **`~/.cache/session-finder/index.json`** on b
 
 The first run reads Claude history from `~/.claude/projects`, Codex history from `~/.codex/sessions`, and archived Codex history from `~/.codex/archived_sessions`. Internal Codex review and subagent runs are excluded. Each later launch reuses unchanged entries, reparses new or changed files, and drops deleted files automatically. **No manual rebuild is needed for normal use.** `--rebuild` forces a full reparse; a missing, invalid, or incompatible cache is rebuilt automatically.
 
+If reading a Claude or Codex session file fails, the load or refresh stops with an error and leaves the existing cache unchanged. Files deleted during indexing are skipped.
+
 Cursor's desktop SQLite database is read on every launch, using a consistent read-only snapshot that includes committed WAL updates. Session metadata supplies the exact workspace or worktree path and latest activity time. Subagent chats and empty drafts are excluded. Missing Cursor history is fine; a database error is reported while the other providers remain searchable.
 
 Cursor sessions are not written to the JSON cache. An open panel keeps its current snapshot until Ctrl-R refreshes it. Search includes user messages, session IDs, and full working directories; Cursor chat titles are also searchable. Ctrl-A adds assistant answers to the search.

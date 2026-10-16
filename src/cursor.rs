@@ -147,33 +147,31 @@ fn scan_connection(connection: &Connection) -> rusqlite::Result<Vec<Session>> {
     let mut composers = connection.prepare(sql)?;
     let mut bubbles =
         connection.prepare("SELECT CAST(value AS BLOB) FROM cursorDiskKV WHERE key=?1")?;
-    let mut rows = composers.query([])?;
-    let mut sessions = Vec::new();
-    while let Some(row) = rows.next()? {
+    let rows = composers.query_map([], |row| {
         let id: String = row.get(0)?;
         if !is_uuid(&id) {
-            continue;
+            return Ok(None);
         }
         let data = row.get_ref(1)?;
         let Ok(bytes) = data.as_bytes() else {
-            continue;
+            return Ok(None);
         };
         let Ok(composer) = serde_json::from_slice::<Composer<'_>>(bytes) else {
-            continue;
+            return Ok(None);
         };
         let header_data = row.get_ref(2)?;
         let header = header_data
             .as_bytes_or_null()?
             .and_then(|bytes| serde_json::from_slice::<Composer<'_>>(bytes).ok());
         if composer.internal() || header.as_ref().is_some_and(Composer::internal) {
-            continue;
+            return Ok(None);
         }
         let Some(cwd) = header
             .as_ref()
             .and_then(Composer::cwd)
             .or_else(|| composer.cwd())
         else {
-            continue;
+            return Ok(None);
         };
         let mut session = Session {
             source: Source::Cursor,
@@ -209,24 +207,29 @@ fn scan_connection(connection: &Connection) -> rusqlite::Result<Vec<Session>> {
                     append_text(&mut session, &text, bubble.kind == Some(2));
                 } else if let Some(bubble_id) = bubble.bubble_id {
                     let key = ["bubbleId:", &session.id, ":", &bubble_id].concat();
-                    if let Some(bytes) = bubbles
-                        .query_row([key], |row| row.get::<_, Option<Vec<u8>>>(0))
-                        .optional()?
-                        .flatten()
-                    {
-                        if let Ok(bubble) = serde_json::from_slice::<Bubble<'_>>(&bytes) {
-                            if matches!(bubble.kind, Some(1 | 2)) {
-                                if let Some(text) = bubble.text {
-                                    append_text(&mut session, &text, bubble.kind == Some(2));
+                    bubbles
+                        .query_row([key], |row| {
+                            if let Some(bytes) = row.get_ref(0)?.as_bytes_or_null()? {
+                                if let Ok(bubble) = serde_json::from_slice::<Bubble<'_>>(bytes) {
+                                    if matches!(bubble.kind, Some(1 | 2)) {
+                                        if let Some(text) = bubble.text {
+                                            append_text(
+                                                &mut session,
+                                                &text,
+                                                bubble.kind == Some(2),
+                                            );
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
+                            Ok(())
+                        })
+                        .optional()?;
                 }
             }
         }
         if session.preview.is_empty() {
-            continue;
+            return Ok(None);
         }
         if let Some(name) = header
             .as_ref()
@@ -236,9 +239,9 @@ fn scan_connection(connection: &Connection) -> rusqlite::Result<Vec<Session>> {
             session.search_text.push('\n');
             session.search_text.push_str(name);
         }
-        sessions.push(session);
-    }
-    Ok(sessions)
+        Ok(Some(session))
+    })?;
+    rows.filter_map(Result::transpose).collect()
 }
 
 fn append_text(session: &mut Session, text: &str, assistant: bool) {
@@ -283,6 +286,8 @@ mod tests {
                 7, {"type": 2, "bubbleId": "assistant"},
                 {"type": 1, "bubbleId": "first"},
                 {"type": 1, "bubbleId": "broken"},
+                {"type": 1, "bubbleId": "missing"},
+                {"type": 1, "bubbleId": "null"},
                 {"type": 1, "bubbleId": "second"}
             ]
         });
@@ -307,6 +312,12 @@ mod tests {
                 )
                 .unwrap();
         }
+        connection
+            .execute(
+                "INSERT INTO cursorDiskKV VALUES (?1,NULL)",
+                [format!("bubbleId:{id}:null")],
+            )
+            .unwrap();
         let found = scan_connection(&connection).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].cwd, PathBuf::from("/work/O'Brien\\repo"));
@@ -332,6 +343,31 @@ mod tests {
             )
             .unwrap();
         assert!(scan_connection(&connection).unwrap().is_empty());
+    }
+
+    #[test]
+    fn collecting_sessions_preserves_sql_errors() {
+        let connection = fixture();
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        connection
+            .execute(
+                "INSERT INTO cursorDiskKV VALUES (?1,?2)",
+                (
+                    format!("composerData:{id}"),
+                    r#"{"workspaceIdentifier":{"uri":{"fsPath":"/work"}}}"#,
+                ),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO composerHeaders VALUES (?1,NULL,'invalid',0,0)",
+                [id],
+            )
+            .unwrap();
+        assert!(matches!(
+            scan_connection(&connection),
+            Err(rusqlite::Error::InvalidColumnType(3, _, _))
+        ));
     }
 
     #[test]

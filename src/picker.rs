@@ -3,6 +3,7 @@ use crate::{
 };
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
 const HEADER: &str = "Enter: copy • Ctrl-O: open • Esc/Ctrl-C: close • *: archived\n\
@@ -12,26 +13,17 @@ fn includes_assistant() -> bool {
     std::env::var("FZF_WITH_NTH").as_deref() == Ok("2..7")
 }
 
-pub fn run_helper(args: &[String]) -> io::Result<bool> {
-    match args {
-        [flag] if flag == "--picker-header" => {
-            println!(
-                "{HEADER} {}",
-                if includes_assistant() { "ON" } else { "OFF" }
-            );
-        }
-        [flag, path, mode, query]
-            if flag == "--picker-preview" && matches!(mode.as_str(), "exact" | "fuzzy") =>
-        {
-            let row = fs::read_to_string(path)?;
-            print!(
-                "{}",
-                preview(&row, query, mode == "fuzzy", includes_assistant())?
-            );
-        }
-        _ => return Ok(false),
-    }
-    Ok(true)
+pub fn print_header() {
+    println!(
+        "{HEADER} {}",
+        if includes_assistant() { "ON" } else { "OFF" }
+    );
+}
+
+pub fn print_preview(path: &Path, query: &str, fuzzy: bool) -> io::Result<()> {
+    let row = fs::read_to_string(path)?;
+    print!("{}", preview(&row, query, fuzzy, includes_assistant())?);
+    Ok(())
 }
 
 pub fn identity(session: &Session) -> String {
@@ -154,42 +146,50 @@ fn match_positions(text: &str, query: &str, fuzzy: bool) -> Option<Vec<usize>> {
             ch.to_lowercase().next().unwrap_or(ch)
         }
     };
-    let text: Vec<_> = text.chars().map(fold).collect();
-    let query: Vec<_> = query.chars().map(fold).collect();
-    if !fuzzy {
+    if fuzzy {
+        // shortcut: highlight a valid subsequence; use fzf's scoring offsets if it exposes them.
+        let mut text = text.chars().map(fold).enumerate();
+        return query
+            .chars()
+            .map(fold)
+            .map(|ch| {
+                text.find(|&(_, candidate)| candidate == ch)
+                    .map(|(index, _)| index)
+            })
+            .collect();
+    }
+    if sensitive {
+        return text.find(query).map(|start| {
+            let start = text[..start].chars().count();
+            (start..start + query.chars().count()).collect()
+        });
+    }
+    if text.is_ascii() && query.is_ascii() {
         return text
+            .as_bytes()
             .windows(query.len())
-            .position(|part| part == query)
+            .position(|part| part.eq_ignore_ascii_case(query.as_bytes()))
             .map(|start| (start..start + query.len()).collect());
     }
-    // shortcut: highlight a valid subsequence; use fzf's scoring offsets if it exposes them.
-    let mut positions = Vec::new();
-    let mut start = 0;
-    for ch in query {
-        let index = start
-            + text[start..]
-                .iter()
-                .position(|&candidate| candidate == ch)?;
-        positions.push(index);
-        start = index + 1;
-    }
-    Some(positions)
+    let text: Vec<_> = text.chars().map(fold).collect();
+    let query: Vec<_> = query.chars().map(fold).collect();
+    text.windows(query.len())
+        .position(|part| part == query)
+        .map(|start| (start..start + query.len()).collect())
 }
 
-fn excerpt(text: &str, positions: &[usize]) -> String {
-    let chars: Vec<_> = text.chars().collect();
-    let start = positions[0].saturating_sub(60);
-    let end = (positions[positions.len() - 1] + 80)
-        .min(chars.len())
-        .min(start + 400);
-    let mut result = if start > 0 {
-        "…".to_owned()
-    } else {
-        String::new()
-    };
+fn excerpt(text: &str, positions: impl DoubleEndedIterator<Item = usize> + Clone) -> String {
+    let start = positions.clone().next().unwrap().saturating_sub(60);
+    let end = (positions.clone().next_back().unwrap() + 80).min(start + 400);
+    let mut positions = positions.peekable();
+    let mut chars = text.chars().enumerate();
+    let mut result = String::with_capacity(text.len().min(400));
+    if start > 0 {
+        result.push('…');
+    }
     let mut highlighted = false;
-    for (index, &ch) in chars.iter().enumerate().take(end).skip(start) {
-        let matched = positions.binary_search(&index).is_ok();
+    for (index, ch) in chars.by_ref().take(end).skip(start) {
+        let matched = positions.next_if_eq(&index).is_some();
         if matched != highlighted {
             result.push_str(if matched { "\x1b[1;33m" } else { "\x1b[0m" });
             highlighted = matched;
@@ -199,7 +199,7 @@ fn excerpt(text: &str, positions: &[usize]) -> String {
     if highlighted {
         result.push_str("\x1b[0m");
     }
-    if end < chars.len() {
+    if chars.next().is_some() {
         result.push('…');
     }
     result
@@ -210,13 +210,12 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
     if row.is_empty() {
         return Ok(String::new());
     }
-    let fields: Vec<_> = row
-        .split('\t')
-        .map(|field| clean(field, usize::MAX))
-        .collect();
-    if fields.len() != 7 {
+    let mut fields = row.split('\t').map(|field| clean(field, usize::MAX));
+    let values: [Option<String>; 7] = std::array::from_fn(|_| fields.next());
+    if values.iter().any(Option::is_none) || fields.next().is_some() {
         return Err(io::Error::other("invalid picker row"));
     }
+    let fields = values.map(Option::unwrap);
     let mut output = format!("PWD: {}\nID: {}\n\n", fields[4], fields[5]);
     if query.is_empty() {
         output.push_str(&format!("Opening user message: {}\n", fields[2]));
@@ -229,7 +228,7 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
         if let Some(positions) = match_positions(text, query, fuzzy) {
             output.push_str(&format!(
                 "Matching {label}:\n{}\n",
-                excerpt(text, &positions)
+                excerpt(text, positions.iter().copied())
             ));
             return Ok(output);
         }
@@ -253,13 +252,14 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
     .zip(searchable)
     {
         let len = text.chars().count();
-        let local: Vec<_> = positions
-            .iter()
-            .filter(|&&position| (offset..offset + len).contains(&position))
-            .map(|position| position - offset)
-            .collect();
+        let start = positions.partition_point(|&position| position < offset);
+        let end = positions.partition_point(|&position| position < offset + len);
+        let local = &positions[start..end];
         if !local.is_empty() {
-            output.push_str(&format!("Matching {label}:\n{}\n", excerpt(text, &local)));
+            output.push_str(&format!(
+                "Matching {label}:\n{}\n",
+                excerpt(text, local.iter().map(|position| position - offset))
+            ));
             message_match |= matches!(*label, "User" | "Assistant" | "Opening user message");
         }
         offset += len + 1;
@@ -317,6 +317,56 @@ mod tests {
         );
         assert_eq!(match_positions("short", "longer query", true), None);
         assert_eq!(match_positions("short", "longer query", false), None);
+        assert_eq!(match_positions("αaβαβ", "αββ", true), Some(vec![0, 2, 4]));
+        assert_eq!(match_positions("İX", "ix", true), Some(vec![0, 1]));
+        assert_eq!(match_positions("İX", "iX", true), None);
+        assert_eq!(match_positions("İX", "ix", false), Some(vec![0, 1]));
+        assert_eq!(match_positions("α Hello", "H", false), Some(vec![2]));
+        assert_eq!(
+            match_positions("a Αβ Hello", "Αβ H", false),
+            Some(vec![2, 3, 4, 5])
+        );
+        assert_eq!(match_positions("anything", "", true), Some(vec![]));
+        assert_eq!(match_positions("anything", "", false), Some(vec![]));
+    }
+
+    #[test]
+    fn excerpts_preserve_unicode_highlights_at_the_end_and_limit_long_spans() {
+        assert_eq!(
+            excerpt("αβγδ", [1, 3].into_iter()),
+            "α\x1b[1;33mβ\x1b[0mγ\x1b[1;33mδ\x1b[0m"
+        );
+        let output = excerpt(&"x".repeat(500), [0, 450].into_iter());
+        assert!(output.ends_with('…'));
+        assert_eq!(output.matches("\x1b[1;33m").count(), 1);
+        assert_eq!(
+            output
+                .replace("\x1b[1;33m", "")
+                .replace("\x1b[0m", "")
+                .chars()
+                .count(),
+            401
+        );
+    }
+
+    #[test]
+    fn picker_rows_require_seven_fields_but_allow_an_empty_assistant_field() {
+        for row in ["a\tb\tc\td\te\tf", "a\tb\tc\td\te\tf\tg\th"] {
+            assert!(preview(row, "query", false, false).is_err());
+        }
+        assert!(
+            preview("id\tnow\topening\tuser\t/work\tid\t", "", false, false)
+                .unwrap()
+                .contains("Opening user message: opening")
+        );
+    }
+
+    #[test]
+    fn fuzzy_metadata_matches_highlight_each_field_with_its_local_positions() {
+        let output = preview("Claude:id\tα\tβ\tγ\t/work\tid\tδ", "αβ", true, false).unwrap();
+        assert!(output.contains("Matching Session:\n\x1b[1;33mα\x1b[0m"));
+        assert!(output.contains("Matching Opening user message:\n\x1b[1;33mβ\x1b[0m"));
+        assert_eq!(output.matches("Opening user message").count(), 1);
     }
 
     #[test]
