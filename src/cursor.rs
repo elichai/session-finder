@@ -187,6 +187,7 @@ fn scan_connection(connection: &Connection) -> rusqlite::Result<Vec<Session>> {
                 .unwrap_or_default()
                 / 1000,
             search_text: String::new(),
+            assistant_text: String::new(),
             preview: String::new(),
             archived: row
                 .get::<_, Option<bool>>(4)?
@@ -201,11 +202,11 @@ fn scan_connection(connection: &Connection) -> rusqlite::Result<Vec<Session>> {
                 let Ok(bubble) = serde_json::from_str::<Bubble<'_>>(part.get()) else {
                     continue;
                 };
-                if bubble.kind != Some(1) {
+                if !matches!(bubble.kind, Some(1 | 2)) {
                     continue;
                 }
                 if let Some(text) = bubble.text {
-                    append_text(&mut session, &text);
+                    append_text(&mut session, &text, bubble.kind == Some(2));
                 } else if let Some(bubble_id) = bubble.bubble_id {
                     let key = ["bubbleId:", &session.id, ":", &bubble_id].concat();
                     if let Some(bytes) = bubbles
@@ -214,9 +215,9 @@ fn scan_connection(connection: &Connection) -> rusqlite::Result<Vec<Session>> {
                         .flatten()
                     {
                         if let Ok(bubble) = serde_json::from_slice::<Bubble<'_>>(&bytes) {
-                            if bubble.kind == Some(1) {
+                            if matches!(bubble.kind, Some(1 | 2)) {
                                 if let Some(text) = bubble.text {
-                                    append_text(&mut session, &text);
+                                    append_text(&mut session, &text, bubble.kind == Some(2));
                                 }
                             }
                         }
@@ -240,17 +241,22 @@ fn scan_connection(connection: &Connection) -> rusqlite::Result<Vec<Session>> {
     Ok(sessions)
 }
 
-fn append_text(session: &mut Session, text: &str) {
+fn append_text(session: &mut Session, text: &str, assistant: bool) {
     if text.trim().is_empty() {
         return;
     }
-    if session.preview.is_empty() {
+    if session.preview.is_empty() && !assistant {
         session.preview = text.chars().take(240).collect();
     }
-    if !session.search_text.is_empty() {
-        session.search_text.push('\n');
+    let target = if assistant {
+        &mut session.assistant_text
+    } else {
+        &mut session.search_text
+    };
+    if !target.is_empty() {
+        target.push('\n');
     }
-    session.search_text.push_str(text);
+    target.push_str(text);
 }
 
 #[cfg(test)]
@@ -308,6 +314,10 @@ mod tests {
         assert!(found[0].archived);
         assert_eq!(found[0].preview, "first phrase");
         assert_eq!(
+            serde_json::to_value(&found[0]).unwrap()["assistant_text"],
+            "do not index assistant"
+        );
+        assert_eq!(
             found[0].search_text,
             "first phrase\nescaped \" quote and β\nuseful title"
         );
@@ -346,6 +356,10 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].cwd, PathBuf::from("/legacy"));
         assert_eq!(found[0].search_text, "legacy user");
+        assert_eq!(
+            serde_json::to_value(&found[0]).unwrap()["assistant_text"],
+            "assistant"
+        );
         assert_eq!(found[0].updated, 12);
         connection
             .execute(

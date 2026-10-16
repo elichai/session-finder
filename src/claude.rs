@@ -84,6 +84,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
     let id = path.file_stem()?.to_string_lossy().into_owned();
     let mut cwd = None;
     let mut search_text = String::new();
+    let mut assistant_text = String::new();
     let mut preview = String::new();
     let mut updated = 0;
     let file = fs::File::open(path).ok()?;
@@ -109,10 +110,11 @@ pub fn parse_file(path: &Path) -> Option<Session> {
         {
             updated = updated.max(ts);
         }
-        if row.kind.as_deref() != Some("user") {
+        if !matches!(row.kind.as_deref(), Some("user" | "assistant")) {
             continue;
         }
-        genuine = true;
+        let assistant = row.kind.as_deref() == Some("assistant");
+        genuine |= !assistant;
         let Some(message) = row.message else {
             continue;
         };
@@ -121,13 +123,18 @@ pub fn parse_file(path: &Path) -> Option<Session> {
         };
         if let Some(text) = user_text(message.content) {
             if !text.trim().is_empty() {
-                if preview.is_empty() {
+                if preview.is_empty() && !assistant {
                     preview = text.chars().take(240).collect();
                 }
-                if !search_text.is_empty() {
-                    search_text.push('\n');
+                let target = if assistant {
+                    &mut assistant_text
+                } else {
+                    &mut search_text
+                };
+                if !target.is_empty() {
+                    target.push('\n');
                 }
-                search_text.push_str(&text);
+                target.push_str(&text);
             }
         }
     }
@@ -150,6 +157,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
         cwd,
         updated,
         search_text,
+        assistant_text,
         preview,
         archived: false,
     })
@@ -252,7 +260,7 @@ mod tests {
         let _ = fs::create_dir_all(&root);
         let id = "123e4567-e89b-12d3-a456-426614174000";
         fs::write(root.join(format!("{id}.jsonl")), format!(
-            "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"/work\",\"timestamp\":\"2025-01-02T03:04:05.000Z\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"find this phrase\"}}]}}}}\nnot-json\n"
+            "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"/work\",\"timestamp\":\"2025-01-02T03:04:05.000Z\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"find this phrase\"}}]}}}}\nnot-json\n{{\"type\":\"assistant\",\"sessionId\":\"{id}\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"assistant answer\"}},{{\"type\":\"tool_use\",\"text\":\"exclude tool\"}}]}}}}\n"
         )).unwrap();
         fs::write(
             root.join("agent-123e4567-e89b-12d3-a456-426614174000.jsonl"),
@@ -264,6 +272,10 @@ mod tests {
         assert_eq!(found[0].id, id);
         assert_eq!(found[0].cwd, PathBuf::from("/work"));
         assert_eq!(found[0].search_text, "find this phrase");
+        assert_eq!(
+            serde_json::to_value(&found[0]).unwrap()["assistant_text"],
+            "assistant answer"
+        );
         assert_eq!(found[0].updated, 1_735_787_045);
     }
 

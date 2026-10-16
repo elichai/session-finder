@@ -97,6 +97,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
     let mut cwd = None;
     let mut updated = None;
     let mut search_text = String::new();
+    let mut assistant_text = String::new();
     let mut preview = String::new();
 
     for line in BufReader::new(file).lines() {
@@ -146,7 +147,8 @@ pub fn parse_file(path: &Path) -> Option<Session> {
             let Ok(payload) = serde_json::from_str::<ResponseItem<'_>>(payload.get()) else {
                 continue;
             };
-            if payload.kind.as_deref() != Some("message") || payload.role.as_deref() != Some("user")
+            if payload.kind.as_deref() != Some("message")
+                || !matches!(payload.role.as_deref(), Some("user" | "assistant"))
             {
                 continue;
             }
@@ -158,23 +160,36 @@ pub fn parse_file(path: &Path) -> Option<Session> {
                     let Ok(block) = serde_json::from_str::<ContentBlock<'_>>(raw.get()) else {
                         continue;
                     };
-                    if block.kind.as_deref() == Some("input_text") {
+                    let assistant = payload.role.as_deref() == Some("assistant");
+                    if block.kind.as_deref()
+                        == Some(if assistant {
+                            "output_text"
+                        } else {
+                            "input_text"
+                        })
+                    {
                         if let Some(text) = block.text {
                             let candidate = text.trim_start();
                             // Codex records injected context as user-role messages.
-                            if candidate.starts_with("# AGENTS.md instructions for ")
-                                || candidate.starts_with("<environment_context>")
-                                || candidate.starts_with("<external_codex_apps_")
+                            if !assistant
+                                && (candidate.starts_with("# AGENTS.md instructions for ")
+                                    || candidate.starts_with("<environment_context>")
+                                    || candidate.starts_with("<external_codex_apps_"))
                             {
                                 continue;
                             }
-                            if preview.is_empty() && !candidate.is_empty() {
+                            if !assistant && preview.is_empty() && !candidate.is_empty() {
                                 preview = candidate.lines().next().unwrap_or_default().to_owned();
                             }
-                            if !search_text.is_empty() {
-                                search_text.push('\n');
+                            let target = if assistant {
+                                &mut assistant_text
+                            } else {
+                                &mut search_text
+                            };
+                            if !target.is_empty() {
+                                target.push('\n');
                             }
-                            search_text.push_str(&text);
+                            target.push_str(&text);
                         }
                     }
                 }
@@ -193,6 +208,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
             preview
         },
         search_text,
+        assistant_text,
         archived: false,
     })
 }
@@ -302,6 +318,19 @@ mod tests {
             Some(BorrowedStr(Cow::Borrowed("user")))
         ));
         writeln!(file, "{mixed}").unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "content": [
+                        {"type": "output_text", "text": "assistant answer"},
+                        {"type": "reasoning_text", "text": "exclude reasoning"}
+                    ]
+                }
+            })
+        )
+        .unwrap();
         writeln!(file, "not json").unwrap();
 
         let found = scan(&root);
@@ -313,6 +342,10 @@ mod tests {
             "<wallet>real request</wallet>\nfixture query\nquote \" and slash \\"
         );
         assert_eq!(found[0].preview, "<wallet>real request</wallet>");
+        assert_eq!(
+            serde_json::to_value(&found[0]).unwrap()["assistant_text"],
+            "assistant answer"
+        );
         assert_eq!(
             found[0].updated,
             parse_timestamp("2026-01-02T03:04:06.000Z").unwrap()

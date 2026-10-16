@@ -1,6 +1,7 @@
 mod claude;
 mod codex;
 mod cursor;
+mod picker;
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u8 = 3;
+const CACHE_VERSION: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Source {
@@ -39,6 +40,7 @@ pub struct Session {
     pub cwd: PathBuf,
     pub updated: i64,
     pub search_text: String,
+    pub assistant_text: String,
     pub preview: String,
     #[serde(default)]
     pub archived: bool,
@@ -72,13 +74,17 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if picker::run_helper(&args)? {
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\nSearch local Claude, Codex, and Cursor sessions, most recent first.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nEnter copies the exact resume command. Ctrl-O opens the selected session in its app. Esc cancels.\nCursor opening requires the local Session Finder helper extension.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\nSESSION_FINDER_CURSOR_DB overrides Cursor's local history database.");
+        println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\nSearch local Claude, Codex, and Cursor sessions, most recent first.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nBoth modes use literal characters and smart case, without extended-search operators.\nEnter copies the exact resume command. Ctrl-O opens the selected session in its app. Esc cancels.\nCtrl-A toggles assistant-answer search (off initially). Ctrl-R refreshes history.\nThe bottom pane shows a highlighted matching passage. Requires fzf 0.71.0 or later.\nAssistant answers are always indexed in the private plaintext cache.\nCursor opening requires the local Session Finder helper extension.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\nSESSION_FINDER_CURSOR_DB overrides Cursor's local history database.");
         return Ok(());
     }
     let rebuild = args.iter().any(|arg| arg == "--rebuild");
     let fuzzy = args.iter().any(|arg| arg == "--fuzzy");
     let list = args.iter().any(|arg| arg == "--list");
+    let picker_rows = args == ["--picker-rows"];
     let print_id = args
         .iter()
         .position(|arg| arg == "--print")
@@ -97,13 +103,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("choose one of --list, --print, or --open".into());
     }
-    if args.iter().any(|arg| {
-        !matches!(
-            arg.as_str(),
-            "--list" | "--print" | "--open" | "--rebuild" | "--fuzzy"
-        ) && Some(arg) != print_id
-            && Some(arg) != open_id
-    }) {
+    if !picker_rows
+        && args.iter().any(|arg| {
+            !matches!(
+                arg.as_str(),
+                "--list" | "--print" | "--open" | "--rebuild" | "--fuzzy"
+            ) && Some(arg) != print_id
+                && Some(arg) != open_id
+        })
+    {
         return Err("unknown argument; use --help".into());
     }
     if (args.iter().any(|arg| arg == "--print") && print_id.is_none())
@@ -130,14 +138,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| {
             home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
         });
-    let sessions = load_sessions(
-        &claude_root,
-        &codex_root,
-        &codex_archive_root,
-        &cursor_db,
-        &cache_path,
-        rebuild,
-    )?;
+    let load = |rebuild| {
+        load_sessions(
+            &claude_root,
+            &codex_root,
+            &codex_archive_root,
+            &cursor_db,
+            &cache_path,
+            rebuild,
+        )
+    };
+    let sessions = load(rebuild)?;
+    if picker_rows {
+        picker::write_rows(&sessions, &mut io::stdout().lock())?;
+        return Ok(());
+    }
     if list {
         for session in &sessions {
             println!(
@@ -169,10 +184,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if sessions.is_empty() {
         return Err("no Claude, Codex, or Cursor sessions found".into());
     }
-    let Some((selected, action)) = choose(&sessions, fuzzy)? else {
+    let Some((selected, action)) = picker::choose(&sessions, fuzzy)? else {
         return Ok(());
     };
-    let session = &sessions[selected];
+    // Refresh runs in a picker child, so resolve its stable identity against fresh history.
+    let sessions = load(false)?;
+    let session = sessions
+        .iter()
+        .find(|session| picker::identity(session) == selected)
+        .ok_or("selected session no longer exists; reopen the picker")?;
     if action == SelectionAction::OpenGui {
         return open_gui(session);
     }
@@ -342,6 +362,14 @@ fn merge_sessions(parts: Vec<Session>) -> Vec<Session> {
                     }
                     existing.search_text.push_str(&part.search_text);
                 }
+                if !part.assistant_text.is_empty()
+                    && !existing.assistant_text.contains(&part.assistant_text)
+                {
+                    if !existing.assistant_text.is_empty() {
+                        existing.assistant_text.push('\n');
+                    }
+                    existing.assistant_text.push_str(&part.assistant_text);
+                }
             }
         }
     }
@@ -382,77 +410,6 @@ fn write_cache(path: &Path, cache: &Cache) -> io::Result<()> {
     file.flush()?;
     file.sync_all()?;
     fs::rename(tmp, path)
-}
-
-fn choose(sessions: &[Session], fuzzy: bool) -> io::Result<Option<(usize, SelectionAction)>> {
-    let mut picker = Command::new("fzf");
-    picker.args([
-        "--delimiter=\t",
-        "--with-nth=2..",
-        "--accept-nth=1",
-        "--expect=ctrl-o",
-        "--no-sort",
-        "--freeze-left=2",
-        "--layout=reverse",
-        "--border",
-        "--height=90%",
-        "--prompt=Sessions> ",
-        "--header=Enter: copy • Ctrl-O: open app • Esc: close • *: archived",
-        "--preview=printf 'PWD: %s\\nID: %s\\n\\nPreview: %s\\n' {5} {6} {3}",
-        "--preview-window=down,7,wrap",
-        "--preview-label=Selected session",
-    ]);
-    if !fuzzy {
-        picker.args(["--exact", "--no-extended"]);
-    }
-    let mut child = picker
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        for (i, session) in sessions.iter().enumerate() {
-            let age = age(session.updated);
-            let cwd = display_cwd(&session.cwd);
-            let full_cwd = clean(&session.cwd.to_string_lossy(), usize::MAX);
-            let preview = clean(&session.preview, 60);
-            let search_text = clean(&session.search_text, usize::MAX);
-            if writeln!(
-                stdin,
-                "{i}\t{age:>8}  {:<7}  {cwd:<28}\t{preview:<60}\t{search_text}\t{}\t{}",
-                display_source(session),
-                full_cwd,
-                session.id
-            )
-            .is_err()
-            {
-                break;
-            }
-        }
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    parse_selection(&output.stdout, sessions.len()).map(Some)
-}
-
-fn parse_selection(output: &[u8], count: usize) -> io::Result<(usize, SelectionAction)> {
-    let output = String::from_utf8_lossy(output);
-    let mut lines = output.lines();
-    let action = match lines.next() {
-        Some("") => SelectionAction::Copy,
-        Some("ctrl-o") => SelectionAction::OpenGui,
-        _ => return Err(io::Error::other("fzf returned an unknown action")),
-    };
-    let index = lines
-        .next()
-        .ok_or_else(|| io::Error::other("fzf returned no selection"))?
-        .parse::<usize>()
-        .map_err(io::Error::other)?;
-    if index >= count {
-        return Err(io::Error::other("fzf returned an invalid selection"));
-    }
-    Ok((index, action))
 }
 
 fn gui_command(session: &Session) -> Result<Command, &'static str> {
@@ -619,6 +576,7 @@ mod tests {
             cwd: PathBuf::from("/tmp/O'Brien; echo bad"),
             updated: 0,
             search_text: String::new(),
+            assistant_text: String::new(),
             preview: String::new(),
             archived: false,
         };
@@ -637,6 +595,7 @@ mod tests {
                 cwd: "/old".into(),
                 updated: 10,
                 search_text: "earlier words".into(),
+                assistant_text: "earlier answer".into(),
                 preview: "earlier".into(),
                 archived: false,
             },
@@ -646,6 +605,7 @@ mod tests {
                 cwd: "/new".into(),
                 updated: 20,
                 search_text: "later words".into(),
+                assistant_text: "later answer".into(),
                 preview: "later".into(),
                 archived: false,
             },
@@ -655,6 +615,8 @@ mod tests {
         assert_eq!(merged[0].cwd, PathBuf::from("/new"));
         assert!(merged[0].search_text.contains("earlier words"));
         assert!(merged[0].search_text.contains("later words"));
+        assert!(merged[0].assistant_text.contains("earlier answer"));
+        assert!(merged[0].assistant_text.contains("later answer"));
     }
 
     #[test]
@@ -665,23 +627,11 @@ mod tests {
             cwd: "/work".into(),
             updated: 1,
             search_text: String::new(),
+            assistant_text: String::new(),
             preview: String::new(),
             archived: true,
         };
         assert_eq!(resume_command(&session), "codex resume 'abc' -C '/work'");
-    }
-
-    #[test]
-    fn picker_distinguishes_copy_from_gui_open() {
-        assert_eq!(
-            parse_selection(b"\n7\n", 8).unwrap(),
-            (7, SelectionAction::Copy)
-        );
-        assert_eq!(
-            parse_selection(b"ctrl-o\n7\n", 8).unwrap(),
-            (7, SelectionAction::OpenGui)
-        );
-        assert!(parse_selection(b"ctrl-o\n8\n", 8).is_err());
     }
 
     #[test]
@@ -692,6 +642,7 @@ mod tests {
             cwd: "/work".into(),
             updated: 0,
             search_text: String::new(),
+            assistant_text: String::new(),
             preview: String::new(),
             archived: false,
         };

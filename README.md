@@ -2,11 +2,11 @@
 
 Find a local Claude Code, Codex, or Cursor conversation by its working directory or by text you wrote in it. The panel starts with the most recently used session. Search matches the typed phrase; run `session-finder --fuzzy` for looser subsequence matching.
 
-`fzf` still reads `FZF_DEFAULT_OPTS` for your preferred appearance and key bindings. The tool sets its search mode explicitly.
+`fzf` still reads `FZF_DEFAULT_OPTS` for your preferred appearance and key bindings. The tool sets its search mode explicitly. Both modes use literal characters and smart case: lowercase queries ignore case; a query containing uppercase letters is case-sensitive. Accents are distinct, and extended-search operators are disabled, including with `--fuzzy`.
 
 ## Install
 
-Requires **fzf 0.67.0 or later**. The picker uses `--freeze-left`, added in [fzf 0.67.0](https://github.com/junegunn/fzf/releases/tag/v0.67.0). SQLite is bundled into the binary; no system SQLite installation is needed. Install the Claude/Codex CLI to resume those providers in a terminal.
+Requires **fzf 0.71.0 or later**. The picker uses field-based selection tracking across refreshes, added in fzf 0.71.0. SQLite is bundled into the binary; no system SQLite installation is needed. Install the Claude/Codex CLI to resume those providers in a terminal.
 
 ### macOS (Homebrew)
 
@@ -24,7 +24,7 @@ sudo apt-get install fzf
 fzf --version
 ```
 
-Distribution packages can be older than 0.67.0. If yours is, install a recent binary from the [official fzf releases](https://github.com/junegunn/fzf/releases) and put it ahead of the older binary in `PATH`.
+Distribution packages can be older than 0.71.0. If yours is, install a recent binary from the [official fzf releases](https://github.com/junegunn/fzf/releases) and put it ahead of the older binary in `PATH`.
 
 Linux supports the Claude/Codex history panel and printed terminal resume commands. Clipboard copying and Codex/Cursor GUI opening currently use macOS tools (`pbcopy` and `open`). The Cursor helper installation instructions below also target macOS. Cursor's default database path is specific to macOS; use `SESSION_FINDER_CURSOR_DB` to point at its database on Linux.
 
@@ -66,6 +66,14 @@ session-finder
 
 On macOS, press Enter to copy and print the resume command, or Ctrl-O to open the selected chat in its app. If clipboard copying is unavailable, the command is still printed. Press Esc to close the panel. The detail pane shows the full working directory and session ID. A `*` marks an archived chat.
 
+A two-line key guide stays visible above the results. It lists copy, open, refresh, assistant search, and close, plus the archived-chat marker. The assistant-search state stays visible when toggled.
+
+The bottom pane updates automatically as you type or move between sessions. It shows a highlighted matching passage, with nearby context and a speaker label. With an empty query, it shows the opening user message. Long passages are excerpted; fuzzy highlighting shows a valid subsequence, which can differ from fzf's preferred alignment.
+
+Press **Ctrl-A** to include assistant answers in search, and press it again to return to user-only search. The header shows `assistant ON` or `OFF`; every launch starts with it off. Assistant answers are always indexed, so toggling does not reread history. Tool output and reasoning blocks are excluded.
+
+Press **Ctrl-R** to refresh history without closing the panel. The query and assistant-search mode stay in place. The selected chat is tracked by provider and session ID while the list is refreshed. Missing or no-longer-matching chats cannot remain selected. Esc and Ctrl-C close normally; picker failures return an error.
+
 For Claude, Ctrl-O uses `claude --desktop --resume ID` in the recorded directory. This requires Claude Code 2.1.285 or later, the Claude Desktop app, and a Claude subscription. Claude rejects a session that is still running in another terminal. Codex uses its desktop session link; terminal resume restores an archived Codex chat to active history.
 
 For Cursor, both Enter's copied command and Ctrl-O use the desktop app, through the small local Session Finder helper extension. They target the existing chat ID; they do not start a CLI conversation. Install the helper once from the repository:
@@ -90,15 +98,15 @@ session-finder --fuzzy             # looser matching
 
 ## Index and automatic updates
 
-The Claude/Codex index is saved at **`~/.cache/session-finder/index.json`** on both macOS and Linux. It stores each source file's size and modification time, plus the session ID, working directory, activity time, preview, and searchable user messages. It is a local JSON cache, not a background service.
+The Claude/Codex index is saved at **`~/.cache/session-finder/index.json`** on both macOS and Linux. It stores each source file's size and modification time, plus the session ID, working directory, activity time, preview, user messages, and assistant answers. It is a local JSON cache, not a background service.
 
 The first run reads Claude history from `~/.claude/projects`, Codex history from `~/.codex/sessions`, and archived Codex history from `~/.codex/archived_sessions`. Internal Codex review and subagent runs are excluded. Each later launch reuses unchanged entries, reparses new or changed files, and drops deleted files automatically. **No manual rebuild is needed for normal use.** `--rebuild` forces a full reparse; a missing, invalid, or incompatible cache is rebuilt automatically.
 
 Cursor's desktop SQLite database is read on every launch, using a consistent read-only snapshot that includes committed WAL updates. Session metadata supplies the exact workspace or worktree path and latest activity time. Subagent chats and empty drafts are excluded. Missing Cursor history is fine; a database error is reported while the other providers remain searchable.
 
-Cursor sessions are not written to the JSON cache. An open panel keeps its launch-time snapshot; reopen it to see new messages. Search includes user messages, session IDs, and full working directories; Cursor chat titles are also searchable.
+Cursor sessions are not written to the JSON cache. An open panel keeps its current snapshot until Ctrl-R refreshes it. Search includes user messages, session IDs, and full working directories; Cursor chat titles are also searchable. Ctrl-A adds assistant answers to the search.
 
-The cache contains your messages in plain text. New cache directories are created with mode `0700`, and the cache file with mode `0600`. Cache updates use a temporary file and rename it into place. Session Finder does not upload history or the cache.
+The cache contains user and assistant text in plain text, including assistant answers when assistant search is off. New cache directories are created with mode `0700`, and the cache file with mode `0600`. Cache updates use a temporary file and rename it into place. Session Finder does not upload history or the cache. The first launch after this update rebuilds older caches automatically.
 
 To change the cache location:
 
