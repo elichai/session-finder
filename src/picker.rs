@@ -3,6 +3,7 @@ use crate::{
 };
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
 const HEADER: &str = "Enter: copy • Ctrl-O: open • Esc/Ctrl-C: close • *: archived\n\
@@ -12,26 +13,17 @@ fn includes_assistant() -> bool {
     std::env::var("FZF_WITH_NTH").as_deref() == Ok("2..7")
 }
 
-pub fn run_helper(args: &[String]) -> io::Result<bool> {
-    match args {
-        [flag] if flag == "--picker-header" => {
-            println!(
-                "{HEADER} {}",
-                if includes_assistant() { "ON" } else { "OFF" }
-            );
-        }
-        [flag, path, mode, query]
-            if flag == "--picker-preview" && matches!(mode.as_str(), "exact" | "fuzzy") =>
-        {
-            let row = fs::read_to_string(path)?;
-            print!(
-                "{}",
-                preview(&row, query, mode == "fuzzy", includes_assistant())?
-            );
-        }
-        _ => return Ok(false),
-    }
-    Ok(true)
+pub fn print_header() {
+    println!(
+        "{HEADER} {}",
+        if includes_assistant() { "ON" } else { "OFF" }
+    );
+}
+
+pub fn print_preview(path: &Path, query: &str, fuzzy: bool) -> io::Result<()> {
+    let row = fs::read_to_string(path)?;
+    print!("{}", preview(&row, query, fuzzy, includes_assistant())?);
+    Ok(())
 }
 
 pub fn identity(session: &Session) -> String {

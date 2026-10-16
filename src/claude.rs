@@ -1,8 +1,8 @@
-use super::{BorrowedStr, Session, Source};
+use super::{json_lines::JsonLines, BorrowedStr, Session, Source};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -38,7 +38,7 @@ struct ClaudeTextBlock<'a> {
 pub fn scan(root: &Path) -> Vec<Session> {
     let mut sessions: Vec<_> = session_files(root)
         .iter()
-        .filter_map(|path| parse_file(path))
+        .filter_map(|path| parse_file(path).unwrap())
         .collect();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated));
     sessions
@@ -80,18 +80,24 @@ fn is_uuid(s: &str) -> bool {
         })
 }
 
-pub fn parse_file(path: &Path) -> Option<Session> {
-    let id = path.file_stem()?.to_string_lossy().into_owned();
+pub fn parse_file(path: &Path) -> io::Result<Option<Session>> {
+    parse_reader(path, BufReader::new(fs::File::open(path)?))
+}
+
+fn parse_reader(path: &Path, reader: impl BufRead) -> io::Result<Option<Session>> {
+    let Some(id) = path.file_stem() else {
+        return Ok(None);
+    };
+    let id = id.to_string_lossy().into_owned();
     let mut cwd = None;
     let mut search_text = String::new();
     let mut assistant_text = String::new();
     let mut preview = String::new();
     let mut updated = 0;
-    let file = fs::File::open(path).ok()?;
     let mut genuine = false;
-    for line in BufReader::new(file).split(b'\n') {
-        let Ok(line) = line else { continue };
-        let Ok(row) = serde_json::from_slice::<ClaudeRow<'_>>(&line) else {
+    let mut lines = JsonLines::new(reader);
+    while let Some(line) = lines.next_line()? {
+        let Ok(row) = serde_json::from_slice::<ClaudeRow<'_>>(line) else {
             continue;
         };
         if row.session_id.as_deref() != Some(id.as_str()) {
@@ -139,19 +145,19 @@ pub fn parse_file(path: &Path) -> Option<Session> {
         }
     }
     if !genuine {
-        return None;
+        return Ok(None);
     }
-    let cwd = cwd?;
+    let Some(cwd) = cwd else {
+        return Ok(None);
+    };
     if updated == 0 {
-        updated = fs::metadata(path)
-            .ok()?
-            .modified()
-            .ok()?
+        updated = fs::metadata(path)?
+            .modified()?
             .duration_since(UNIX_EPOCH)
-            .ok()?
+            .map_err(io::Error::other)?
             .as_secs() as i64;
     }
-    Some(Session {
+    Ok(Some(Session {
         source: Source::Claude,
         id,
         cwd,
@@ -160,7 +166,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
         assistant_text,
         preview,
         archived: false,
-    })
+    }))
 }
 
 fn user_text(value: Option<&RawValue>) -> Option<String> {
@@ -188,67 +194,69 @@ fn user_text(value: Option<&RawValue>) -> Option<String> {
     Some(text)
 }
 
-// Claude timestamps are RFC3339. Convert UTC calendar dates without a date crate.
-fn parse_timestamp(s: &str) -> Option<i64> {
-    let bytes = s.as_bytes();
-    if bytes.len() < 20 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
-        return s.parse().ok();
-    }
-    let number = |range: std::ops::Range<usize>| s.get(range)?.parse::<i64>().ok();
-    let (y, m, d, hh, mm, ss) = (
-        number(0..4)?,
-        number(5..7)?,
-        number(8..10)?,
-        number(11..13)?,
-        number(14..16)?,
-        number(17..19)?,
-    );
-    let days = days_from_civil(y, m, d)?;
-    let mut epoch = days.checked_mul(86_400)? + hh * 3600 + mm * 60 + ss;
-    if bytes.get(19) == Some(&b'.') {
-        let mut i = 20;
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-        if let Some(zone) = s.get(i..) {
-            epoch -= zone_offset(zone)?;
-        }
-    } else if let Some(zone) = s.get(19..) {
-        epoch -= zone_offset(zone)?;
-    }
-    Some(epoch)
-}
-
-fn zone_offset(zone: &str) -> Option<i64> {
-    if zone == "Z" {
-        return Some(0);
-    }
-    let sign = match zone.as_bytes().first()? {
-        b'+' => 1,
-        b'-' => -1,
-        _ => return None,
-    };
-    let hh = zone.get(1..3)?.parse::<i64>().ok()?;
-    let mm = zone.get(4..6)?.parse::<i64>().ok()?;
-    Some(sign * (hh * 3600 + mm * 60))
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let y = year - i64::from(month <= 2);
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    Some(era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468)
+fn parse_timestamp(value: &str) -> Option<i64> {
+    crate::timestamp::parse(value).or_else(|| value.parse().ok())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::borrow::Cow;
+
+    #[test]
+    fn read_errors_do_not_return_a_partial_session() {
+        let prefix = b"{\"type\":\"user\",\"sessionId\":\"123e4567-e89b-12d3-a456-426614174000\",\"cwd\":\"/work\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"message\":{\"content\":\"partial conversation\"}}\n";
+        let reader = crate::json_lines::reader_failing_after(prefix);
+        let path = Path::new("123e4567-e89b-12d3-a456-426614174000.jsonl");
+        assert_eq!(
+            parse_reader(path, reader).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn timestamps_handle_offsets_fractions_and_calendar_boundaries() {
+        for (value, expected) in [
+            ("1970-01-01T00:00:00Z", 0),
+            ("2025-01-01t00:00:00Z", 1_735_689_600),
+            ("2025-01-01T00:00:00z", 1_735_689_600),
+            ("2025-01-01t00:00:00.123z", 1_735_689_600),
+            ("1969-12-31T23:59:59Z", -1),
+            ("1970-01-01T01:30:00.123456+01:30", 0),
+            ("1969-12-31T22:30:00-01:30", 0),
+            ("2000-02-29T00:00:00Z", 951_782_400),
+            ("1900-03-01T00:00:00Z", -2_203_891_200),
+            ("2016-12-31T23:59:60Z", 1_483_228_800),
+            ("1735787045", 1_735_787_045),
+        ] {
+            assert_eq!(parse_timestamp(value), Some(expected), "{value}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_timestamps() {
+        for value in [
+            "2025-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2025-04-31T00:00:00Z",
+            "2025-01-01T24:00:00Z",
+            "2025-01-01T00:60:00Z",
+            "2025-01-01T00:00:61Z",
+            "2025-01-01T-1:00:00Z",
+            "2025-01-01X00:00:00Z",
+            "2025-01-01T00-00:00Z",
+            "2025-01-01T00:00:00.Z",
+            "2025-01-01T00:00:00+24:00",
+            "2025-01-01T00:00:00+00:60",
+            "2025-01-01T00:00:00+01-30",
+            "2025-01-01T00:00:00+01:30junk",
+            "2025-01-01T00:00:00",
+            "2025-01-01T00:00:00.123",
+            "2025-01-01T00:00:00é",
+        ] {
+            assert_eq!(parse_timestamp(value), None, "{value}");
+        }
+    }
 
     #[test]
     fn scans_conversation_and_ignores_sidecar_and_bad_lines() {
