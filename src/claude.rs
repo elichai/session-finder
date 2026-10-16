@@ -1,6 +1,7 @@
-use super::{json_lines::JsonLines, BorrowedStr, Session, Source};
+use super::{json_lines::JsonLines, session_files::SessionFiles, BorrowedStr, Session, Source};
 use serde::Deserialize;
 use serde_json::value::RawValue;
+use std::borrow::Cow;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -37,39 +38,19 @@ struct ClaudeTextBlock<'a> {
 #[cfg(test)]
 pub fn scan(root: &Path) -> Vec<Session> {
     let mut sessions: Vec<_> = session_files(root)
-        .iter()
-        .filter_map(|path| parse_file(path).unwrap())
+        .filter_map(|path| parse_file(&path).unwrap())
         .collect();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated));
     sessions
 }
 
-pub fn session_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect(root, &mut files);
-    files
-}
-
-fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            collect(&path, files);
-        } else if kind.is_file()
-            && path.extension().is_some_and(|ext| ext == "jsonl")
+pub fn session_files(root: &Path) -> SessionFiles {
+    SessionFiles::new(root, |path| {
+        path.extension().is_some_and(|ext| ext == "jsonl")
             && path
                 .file_stem()
                 .is_some_and(|stem| is_uuid(&stem.to_string_lossy()))
-        {
-            files.push(path);
-        }
-    }
+    })
 }
 
 fn is_uuid(s: &str) -> bool {
@@ -175,23 +156,16 @@ fn user_text(value: Option<&RawValue>) -> Option<String> {
         return Some(text.0.into_owned());
     }
     let parts = serde_json::from_str::<Vec<&RawValue>>(raw).ok()?;
-    let mut text = String::new();
-    let mut first = true;
-    for part in parts {
-        let Ok(part) = serde_json::from_str::<ClaudeTextBlock<'_>>(part.get()) else {
-            continue;
-        };
-        if part.kind.as_deref() == Some("text") {
-            if let Some(content) = part.text {
-                if !first {
-                    text.push(' ');
-                }
-                first = false;
-                text.push_str(&content);
-            }
-        }
-    }
-    Some(text)
+    Some(
+        parts
+            .into_iter()
+            .filter_map(|part| serde_json::from_str::<ClaudeTextBlock<'_>>(part.get()).ok())
+            .filter(|part| part.kind.as_deref() == Some("text"))
+            .filter_map(|part| part.text)
+            .flat_map(|content| [Cow::Borrowed(" "), content.0])
+            .skip(1)
+            .collect(),
+    )
 }
 
 fn parse_timestamp(value: &str) -> Option<i64> {

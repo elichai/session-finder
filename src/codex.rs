@@ -1,5 +1,6 @@
 use crate::{
-    json_lines::JsonLines, timestamp::parse as parse_timestamp, BorrowedStr, Session, Source,
+    json_lines::JsonLines, session_files::SessionFiles, timestamp::parse as parse_timestamp,
+    BorrowedStr, Session, Source,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -51,39 +52,18 @@ struct ContentBlock<'a> {
 #[cfg(test)]
 pub fn scan(root: &Path) -> Vec<Session> {
     let mut sessions: Vec<_> = session_files(root)
-        .into_iter()
         .filter_map(|path| parse_file(&path).unwrap())
         .collect();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated));
     sessions
 }
 
-pub fn session_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect_rollouts(root, &mut files);
-    files
-}
-
-fn collect_rollouts(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            collect_rollouts(&path, files);
-        } else if kind.is_file()
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
-        {
-            files.push(path);
-        }
-    }
+pub fn session_files(root: &Path) -> SessionFiles {
+    SessionFiles::new(root, |path| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+    })
 }
 
 pub fn parse_file(path: &Path) -> io::Result<Option<Session>> {

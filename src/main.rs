@@ -4,6 +4,7 @@ mod codex;
 mod cursor;
 mod json_lines;
 mod picker;
+mod session_files;
 mod timestamp;
 
 use args::{Action, Args};
@@ -121,18 +122,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Action::Print(id) | Action::Open(id) = &args.action {
-        let matches: Vec<_> = sessions
-            .iter()
-            .filter(|session| session.id == *id)
-            .collect();
-        if matches.len() != 1 {
-            return Err(format!("expected one session for {id}, found {}", matches.len()).into());
-        }
+        let mut matches = sessions.iter().filter(|session| session.id == *id);
+        let session = match (matches.next(), matches.count()) {
+            (Some(session), 0) => session,
+            (first, remaining) => {
+                let count = usize::from(first.is_some()) + remaining;
+                return Err(format!("expected one session for {id}, found {count}").into());
+            }
+        };
         if matches!(args.action, Action::Open(_)) {
-            return open_gui(matches[0]);
+            return open_gui(session);
         }
-        warn_if_missing(matches[0]);
-        println!("{}", resume_command(matches[0]));
+        warn_if_missing(session);
+        println!("{}", resume_command(session));
         return Ok(());
     }
     if sessions.is_empty() {
@@ -207,26 +209,29 @@ impl History {
             eprintln!("Indexing local history; the first run may take a few seconds...");
         }
         let mut previous = old.entries;
-        let mut next = HashMap::new();
+        let mut next = HashMap::with_capacity(previous.len());
         let mut changed = 0;
-        for (files, parse, archived) in [
+        for (root, files, parse, archived) in [
             (
-                claude::session_files(&self.claude_root),
+                &self.claude_root,
+                claude::session_files as fn(&Path) -> session_files::SessionFiles,
                 claude::parse_file as fn(&Path) -> io::Result<Option<Session>>,
                 false,
             ),
             (
-                codex::session_files(&self.codex_root),
+                &self.codex_root,
+                codex::session_files,
                 codex::parse_file,
                 false,
             ),
             (
-                codex::session_files(&self.codex_archive_root),
+                &self.codex_archive_root,
+                codex::session_files,
                 codex::parse_file,
                 true,
             ),
         ] {
-            for path in files {
+            for path in files(root) {
                 let Ok(meta) = fs::metadata(&path) else {
                     continue;
                 };
@@ -320,7 +325,9 @@ impl History {
 }
 
 fn merge_sessions(parts: impl IntoIterator<Item = Session>) -> Vec<Session> {
-    let mut merged: HashMap<(Source, String), Session> = HashMap::new();
+    let parts = parts.into_iter();
+    let mut merged: HashMap<(Source, String), Session> =
+        HashMap::with_capacity(parts.size_hint().0);
     for mut part in parts {
         let key = (part.source, part.id.clone());
         match merged.get_mut(&key) {
@@ -440,11 +447,15 @@ fn open_gui(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cursor_url(session: &Session) -> String {
-    let mut url = String::from("cursor://session-finder.cursor-session-opener/open?id=");
+    const PREFIX: &str = "cursor://session-finder.cursor-session-opener/open?id=";
+    let cwd = session.cwd.as_os_str().as_encoded_bytes();
+    let mut url =
+        String::with_capacity(PREFIX.len() + session.id.len() + "&cwd=".len() + cwd.len());
+    url.push_str(PREFIX);
     url.push_str(&session.id);
     url.push_str("&cwd=");
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for &byte in session.cwd.as_os_str().as_encoded_bytes() {
+    for &byte in cwd {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
             url.push(char::from(byte));
         } else {
