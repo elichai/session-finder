@@ -1,19 +1,24 @@
+mod args;
 mod claude;
 mod codex;
 mod cursor;
+mod json_lines;
 mod picker;
+mod session_files;
+mod timestamp;
 
+use args::{Action, Args};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u8 = 4;
+const CACHE_VERSION: u8 = 5;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Source {
@@ -59,6 +64,14 @@ struct Cache {
     entries: HashMap<String, CacheEntry>,
 }
 
+struct History {
+    claude_root: PathBuf,
+    codex_root: PathBuf,
+    codex_archive_root: PathBuf,
+    cursor_db: PathBuf,
+    cache_path: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SelectionAction {
     Copy,
@@ -73,87 +86,29 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if picker::run_helper(&args)? {
-        return Ok(());
+    let args = Args::parse(std::env::args().skip(1))?;
+    match &args.action {
+        Action::PickerHeader => {
+            picker::print_header();
+            return Ok(());
+        }
+        Action::PickerPreview { path, fuzzy, query } => {
+            return Ok(picker::print_preview(path, query, *fuzzy)?);
+        }
+        _ => (),
     }
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    if args.action == Action::Help {
         println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\nSearch local Claude, Codex, and Cursor sessions, most recent first.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nBoth modes use literal characters and smart case, without extended-search operators.\nEnter copies the exact resume command. Ctrl-O opens the selected session in its app. Esc cancels.\nCtrl-A toggles assistant-answer search (off initially). Ctrl-R refreshes history.\nThe bottom pane shows a highlighted matching passage. Requires fzf 0.71.0 or later.\nAssistant answers are always indexed in the private plaintext cache.\nCursor opening requires the local Session Finder helper extension.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\nSESSION_FINDER_CURSOR_DB overrides Cursor's local history database.");
         return Ok(());
     }
-    let rebuild = args.iter().any(|arg| arg == "--rebuild");
-    let fuzzy = args.iter().any(|arg| arg == "--fuzzy");
-    let list = args.iter().any(|arg| arg == "--list");
-    let picker_rows = args == ["--picker-rows"];
-    let print_id = args
-        .iter()
-        .position(|arg| arg == "--print")
-        .and_then(|i| args.get(i + 1))
-        .filter(|id| !id.starts_with('-'));
-    let open_id = args
-        .iter()
-        .position(|arg| arg == "--open")
-        .and_then(|i| args.get(i + 1))
-        .filter(|id| !id.starts_with('-'));
-    if args
-        .iter()
-        .filter(|arg| matches!(arg.as_str(), "--list" | "--print" | "--open"))
-        .count()
-        > 1
-    {
-        return Err("choose one of --list, --print, or --open".into());
-    }
-    if !picker_rows
-        && args.iter().any(|arg| {
-            !matches!(
-                arg.as_str(),
-                "--list" | "--print" | "--open" | "--rebuild" | "--fuzzy"
-            ) && Some(arg) != print_id
-                && Some(arg) != open_id
-        })
-    {
-        return Err("unknown argument; use --help".into());
-    }
-    if (args.iter().any(|arg| arg == "--print") && print_id.is_none())
-        || (args.iter().any(|arg| arg == "--open") && open_id.is_none())
-    {
-        return Err("--print and --open need a session ID".into());
-    }
 
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is unset")?);
-    let claude_root = std::env::var_os("SESSION_FINDER_CLAUDE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".claude/projects"));
-    let codex_root = std::env::var_os("SESSION_FINDER_CODEX_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".codex/sessions"));
-    let codex_archive_root = std::env::var_os("SESSION_FINDER_CODEX_ARCHIVE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".codex/archived_sessions"));
-    let cache_path = std::env::var_os("SESSION_FINDER_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".cache/session-finder/index.json"));
-    let cursor_db = std::env::var_os("SESSION_FINDER_CURSOR_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
-        });
-    let load = |rebuild| {
-        load_sessions(
-            &claude_root,
-            &codex_root,
-            &codex_archive_root,
-            &cursor_db,
-            &cache_path,
-            rebuild,
-        )
-    };
-    let sessions = load(rebuild)?;
-    if picker_rows {
+    let history = History::from_env()?;
+    let sessions = history.load(args.rebuild)?;
+    if args.action == Action::PickerRows {
         picker::write_rows(&sessions, &mut io::stdout().lock())?;
         return Ok(());
     }
-    if list {
+    if args.action == Action::List {
         for session in &sessions {
             println!(
                 "{}\t{}\t{}\t{}\t{}",
@@ -166,29 +121,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    if let Some(id) = print_id.or(open_id) {
-        let matches: Vec<_> = sessions
-            .iter()
-            .filter(|session| session.id == *id)
-            .collect();
-        if matches.len() != 1 {
-            return Err(format!("expected one session for {id}, found {}", matches.len()).into());
+    if let Action::Print(id) | Action::Open(id) = &args.action {
+        let mut matches = sessions.iter().filter(|session| session.id == *id);
+        let session = match (matches.next(), matches.count()) {
+            (Some(session), 0) => session,
+            (first, remaining) => {
+                let count = usize::from(first.is_some()) + remaining;
+                return Err(format!("expected one session for {id}, found {count}").into());
+            }
+        };
+        if matches!(args.action, Action::Open(_)) {
+            return open_gui(session);
         }
-        if open_id.is_some() {
-            return open_gui(matches[0]);
-        }
-        warn_if_missing(matches[0]);
-        println!("{}", resume_command(matches[0]));
+        warn_if_missing(session);
+        println!("{}", resume_command(session));
         return Ok(());
     }
     if sessions.is_empty() {
         return Err("no Claude, Codex, or Cursor sessions found".into());
     }
-    let Some((selected, action)) = picker::choose(&sessions, fuzzy)? else {
+    let Some((selected, action)) = picker::choose(&sessions, args.fuzzy)? else {
         return Ok(());
     };
     // Refresh runs in a picker child, so resolve its stable identity against fresh history.
-    let sessions = load(false)?;
+    let sessions = history.load(false)?;
     let session = sessions
         .iter()
         .find(|session| picker::identity(session) == selected)
@@ -218,132 +174,160 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_sessions(
-    claude_root: &Path,
-    codex_root: &Path,
-    codex_archive_root: &Path,
-    cursor_db: &Path,
-    cache_path: &Path,
-    rebuild: bool,
-) -> io::Result<Vec<Session>> {
-    let debug = std::env::var_os("SESSION_FINDER_DEBUG").is_some();
-    let started = Instant::now();
-    let old = if rebuild {
-        Cache::default()
-    } else {
-        read_cache(cache_path)
-    };
-    if old.version != CACHE_VERSION {
-        eprintln!("Indexing local history; the first run may take a few seconds...");
-    }
-    let mut previous = old.entries;
-    let mut next = HashMap::new();
-    let mut changed = 0;
-    for (path, parse, archived) in claude::session_files(claude_root)
-        .into_iter()
-        .map(|path| {
-            (
-                path,
-                claude::parse_file as fn(&Path) -> Option<Session>,
-                false,
-            )
-        })
-        .chain(codex::session_files(codex_root).into_iter().map(|path| {
-            (
-                path,
-                codex::parse_file as fn(&Path) -> Option<Session>,
-                false,
-            )
-        }))
-        .chain(
-            codex::session_files(codex_archive_root)
-                .into_iter()
-                .map(|path| {
-                    (
-                        path,
-                        codex::parse_file as fn(&Path) -> Option<Session>,
-                        true,
-                    )
-                }),
-        )
-    {
-        let Ok(meta) = fs::metadata(&path) else {
-            continue;
+impl History {
+    fn from_env() -> Result<Self, &'static str> {
+        let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is unset")?);
+        let path = |variable, default| {
+            std::env::var_os(variable)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(default))
         };
-        let modified_ns = meta
-            .modified()
-            .ok()
-            .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |time| time.as_nanos());
-        let key = path.to_string_lossy().into_owned();
-        let entry = match previous.remove(&key) {
-            Some(entry) if entry.modified_ns == modified_ns && entry.len == meta.len() => entry,
-            _ => {
-                changed += 1;
-                let parse_started = Instant::now();
-                let session = parse(&path).map(|mut session| {
-                    session.archived = archived;
-                    session
-                });
-                if debug {
-                    eprintln!(
-                        "parsed {} bytes in {:?}: {}",
-                        meta.len(),
-                        parse_started.elapsed(),
-                        path.display()
-                    );
-                }
-                CacheEntry {
-                    modified_ns,
-                    len: meta.len(),
-                    session,
-                }
+        Ok(Self {
+            claude_root: path("SESSION_FINDER_CLAUDE_ROOT", ".claude/projects"),
+            codex_root: path("SESSION_FINDER_CODEX_ROOT", ".codex/sessions"),
+            codex_archive_root: path(
+                "SESSION_FINDER_CODEX_ARCHIVE_ROOT",
+                ".codex/archived_sessions",
+            ),
+            cursor_db: path(
+                "SESSION_FINDER_CURSOR_DB",
+                "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
+            ),
+            cache_path: path("SESSION_FINDER_CACHE", ".cache/session-finder/index.json"),
+        })
+    }
+
+    fn load(&self, rebuild: bool) -> io::Result<Vec<Session>> {
+        let debug = std::env::var_os("SESSION_FINDER_DEBUG").is_some();
+        let started = Instant::now();
+        let old = if rebuild {
+            Cache::default()
+        } else {
+            read_cache(&self.cache_path)
+        };
+        if old.version != CACHE_VERSION {
+            eprintln!("Indexing local history; the first run may take a few seconds...");
+        }
+        let mut previous = old.entries;
+        let mut next = HashMap::with_capacity(previous.len());
+        let mut changed = 0;
+        for (root, files, parse, archived) in [
+            (
+                &self.claude_root,
+                claude::session_files as fn(&Path) -> session_files::SessionFiles,
+                claude::parse_file as fn(&Path) -> io::Result<Option<Session>>,
+                false,
+            ),
+            (
+                &self.codex_root,
+                codex::session_files,
+                codex::parse_file,
+                false,
+            ),
+            (
+                &self.codex_archive_root,
+                codex::session_files,
+                codex::parse_file,
+                true,
+            ),
+        ] {
+            for path in files(root) {
+                let Ok(meta) = fs::metadata(&path) else {
+                    continue;
+                };
+                let modified_ns = meta
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |time| time.as_nanos());
+                let key = path.to_string_lossy().into_owned();
+                let entry = match previous.remove(&key) {
+                    Some(entry) if entry.modified_ns == modified_ns && entry.len == meta.len() => {
+                        entry
+                    }
+                    _ => {
+                        changed += 1;
+                        let parse_started = Instant::now();
+                        let session = match parse(&path) {
+                            Ok(session) => session,
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                            Err(error) => {
+                                return Err(io::Error::new(
+                                    error.kind(),
+                                    format!("could not read {}: {error}", path.display()),
+                                ));
+                            }
+                        }
+                        .map(|mut session| {
+                            session.archived = archived;
+                            session
+                        });
+                        if debug {
+                            eprintln!(
+                                "parsed {} bytes in {:?}: {}",
+                                meta.len(),
+                                parse_started.elapsed(),
+                                path.display()
+                            );
+                        }
+                        CacheEntry {
+                            modified_ns,
+                            len: meta.len(),
+                            session,
+                        }
+                    }
+                };
+                next.insert(key, entry);
+            }
+        }
+        let removed = !previous.is_empty();
+        let cache = Cache {
+            version: CACHE_VERSION,
+            entries: next,
+        };
+        if changed > 0 || removed || old.version != CACHE_VERSION {
+            let write_started = Instant::now();
+            write_cache(&self.cache_path, &cache)?;
+            if debug {
+                eprintln!(
+                    "wrote cache in {:?}; total {:?}",
+                    write_started.elapsed(),
+                    started.elapsed()
+                );
+            }
+            if changed > 0 {
+                eprintln!("Indexed {changed} changed session files.");
+            }
+        }
+        let cursor_sessions = match cursor::scan(&self.cursor_db) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                eprintln!("Could not read Cursor history: {error}");
+                Vec::new()
             }
         };
-        next.insert(key, entry);
-    }
-    let removed = !previous.is_empty();
-    let mut sessions: Vec<Session> = next
-        .values()
-        .filter_map(|entry| entry.session.clone())
-        .collect();
-    match cursor::scan(cursor_db) {
-        Ok(cursor_sessions) => sessions.extend(cursor_sessions),
-        Err(error) => eprintln!("Could not read Cursor history: {error}"),
-    }
-    let sessions = merge_sessions(sessions);
-    if changed > 0 || removed || old.version != CACHE_VERSION {
-        let write_started = Instant::now();
-        write_cache(
-            cache_path,
-            &Cache {
-                version: CACHE_VERSION,
-                entries: next,
-            },
-        )?;
+        let sessions = merge_sessions(
+            cache
+                .entries
+                .into_values()
+                .filter_map(|entry| entry.session)
+                .chain(cursor_sessions),
+        );
         if debug {
             eprintln!(
-                "wrote cache in {:?}; total {:?}",
-                write_started.elapsed(),
+                "loaded {} sessions in {:?}",
+                sessions.len(),
                 started.elapsed()
             );
         }
-        if changed > 0 {
-            eprintln!("Indexed {changed} changed session files.");
-        }
+        Ok(sessions)
     }
-    if debug {
-        eprintln!(
-            "loaded {} sessions in {:?}",
-            sessions.len(),
-            started.elapsed()
-        );
-    }
-    Ok(sessions)
 }
 
-fn merge_sessions(parts: Vec<Session>) -> Vec<Session> {
-    let mut merged: HashMap<(Source, String), Session> = HashMap::new();
+fn merge_sessions(parts: impl IntoIterator<Item = Session>) -> Vec<Session> {
+    let parts = parts.into_iter();
+    let mut merged: HashMap<(Source, String), Session> =
+        HashMap::with_capacity(parts.size_hint().0);
     for mut part in parts {
         let key = (part.source, part.id.clone());
         match merged.get_mut(&key) {
@@ -401,14 +385,15 @@ fn write_cache(path: &Path, cache: &Cache) -> io::Result<()> {
         .unwrap_or_default()
         .as_nanos();
     let tmp = path.with_extension(format!("tmp-{}-{stamp}", std::process::id()));
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
-    file.write_all(&serde_json::to_vec(cache)?)?;
+    let mut file = BufWriter::new(file);
+    serde_json::to_writer(&mut file, cache)?;
     file.flush()?;
-    file.sync_all()?;
+    file.get_ref().sync_all()?;
     fs::rename(tmp, path)
 }
 
@@ -462,11 +447,15 @@ fn open_gui(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cursor_url(session: &Session) -> String {
-    let mut url = String::from("cursor://session-finder.cursor-session-opener/open?id=");
+    const PREFIX: &str = "cursor://session-finder.cursor-session-opener/open?id=";
+    let cwd = session.cwd.as_os_str().as_encoded_bytes();
+    let mut url =
+        String::with_capacity(PREFIX.len() + session.id.len() + "&cwd=".len() + cwd.len());
+    url.push_str(PREFIX);
     url.push_str(&session.id);
     url.push_str("&cwd=");
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for &byte in session.cwd.as_os_str().as_encoded_bytes() {
+    for &byte in cwd {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
             url.push(char::from(byte));
         } else {
@@ -677,10 +666,64 @@ mod tests {
     }
 
     #[test]
+    fn cache_writes_round_trip_and_replace_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("session-cache-roundtrip-{}", std::process::id()));
+        let path = root.join("index.json");
+        let mut cache = Cache {
+            version: CACHE_VERSION,
+            entries: HashMap::from([(
+                "/fixture.jsonl".into(),
+                CacheEntry {
+                    modified_ns: 1_234_567_890_123_456_789,
+                    len: 42,
+                    session: Some(Session {
+                        source: Source::Claude,
+                        id: "session-id".into(),
+                        cwd: "/tmp/α\\work".into(),
+                        updated: 123,
+                        search_text: "quoted \"message\"\nnext line".into(),
+                        assistant_text: "answer\tβ".into(),
+                        preview: "quoted \"message\"".into(),
+                        archived: true,
+                    }),
+                },
+            )]),
+        };
+        write_cache(&path, &cache).unwrap();
+        let loaded = read_cache(&path);
+        assert_eq!(loaded.version, CACHE_VERSION);
+        let entry = &loaded.entries["/fixture.jsonl"];
+        assert_eq!(entry.modified_ns, 1_234_567_890_123_456_789);
+        assert_eq!(entry.len, 42);
+        let session = entry.session.as_ref().unwrap();
+        assert_eq!(session.cwd, Path::new("/tmp/α\\work"));
+        assert_eq!(session.search_text, "quoted \"message\"\nnext line");
+        assert_eq!(session.assistant_text, "answer\tβ");
+        assert!(session.archived);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        cache.entries.clear();
+        write_cache(&path, &cache).unwrap();
+        assert!(read_cache(&path).entries.is_empty());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_old_cache_after_parser_policy_changes() {
         let path =
             std::env::temp_dir().join(format!("session-cache-version-{}.json", std::process::id()));
-        fs::write(&path, r#"{"version":2,"entries":{}}"#).unwrap();
+        fs::write(&path, r#"{"version":4,"entries":{}}"#).unwrap();
         assert_eq!(read_cache(&path).version, 0);
         fs::remove_file(path).unwrap();
     }

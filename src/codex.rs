@@ -1,9 +1,12 @@
-use crate::{BorrowedStr, Session, Source};
+use crate::{
+    json_lines::JsonLines, session_files::SessionFiles, timestamp::parse as parse_timestamp,
+    BorrowedStr, Session, Source,
+};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -49,50 +52,30 @@ struct ContentBlock<'a> {
 #[cfg(test)]
 pub fn scan(root: &Path) -> Vec<Session> {
     let mut sessions: Vec<_> = session_files(root)
-        .into_iter()
-        .filter_map(|path| parse_file(&path))
+        .filter_map(|path| parse_file(&path).unwrap())
         .collect();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated));
     sessions
 }
 
-pub fn session_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect_rollouts(root, &mut files);
-    files
+pub fn session_files(root: &Path) -> SessionFiles {
+    SessionFiles::new(root, |path| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+    })
 }
 
-fn collect_rollouts(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            collect_rollouts(&path, files);
-        } else if kind.is_file()
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
-        {
-            files.push(path);
-        }
-    }
-}
-
-pub fn parse_file(path: &Path) -> Option<Session> {
-    let modified = fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
+pub fn parse_file(path: &Path) -> io::Result<Option<Session>> {
+    let modified = fs::metadata(path)?
+        .modified()?
         .duration_since(UNIX_EPOCH)
-        .ok()?
+        .map_err(io::Error::other)?
         .as_secs() as i64;
-    let file = fs::File::open(path).ok()?;
+    parse_reader(BufReader::new(fs::File::open(path)?), modified)
+}
+
+fn parse_reader(reader: impl BufRead, modified: i64) -> io::Result<Option<Session>> {
     let mut id = None;
     let mut cwd = None;
     let mut updated = None;
@@ -100,9 +83,9 @@ pub fn parse_file(path: &Path) -> Option<Session> {
     let mut assistant_text = String::new();
     let mut preview = String::new();
 
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { continue };
-        let Ok(record) = serde_json::from_str::<CodexRecord<'_>>(&line) else {
+    let mut lines = JsonLines::new(reader);
+    while let Some(line) = lines.next_line()? {
+        let Ok(record) = serde_json::from_slice::<CodexRecord<'_>>(line) else {
             continue;
         };
         if let Some(raw) = record.timestamp {
@@ -127,7 +110,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
                 thread_source.as_deref(),
                 Some("guardian_review" | "subagent")
             ) {
-                return None;
+                return Ok(None);
             }
             let Some(meta_id) = meta.id else {
                 continue;
@@ -197,10 +180,13 @@ pub fn parse_file(path: &Path) -> Option<Session> {
         }
     }
 
-    Some(Session {
+    let (Some(id), Some(cwd)) = (id, cwd) else {
+        return Ok(None);
+    };
+    Ok(Some(Session {
         source: Source::Codex,
-        id: id?,
-        cwd: cwd?,
+        id,
+        cwd,
         updated: updated.unwrap_or(modified),
         preview: if preview.is_empty() {
             search_text.lines().next().unwrap_or_default().to_owned()
@@ -210,7 +196,7 @@ pub fn parse_file(path: &Path) -> Option<Session> {
         search_text,
         assistant_text,
         archived: false,
-    })
+    }))
 }
 
 pub(crate) fn is_uuid(value: &str) -> bool {
@@ -221,69 +207,35 @@ pub(crate) fn is_uuid(value: &str) -> bool {
         })
 }
 
-fn parse_timestamp(value: &str) -> Option<i64> {
-    let bytes = value.as_bytes();
-    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
-        return None;
-    }
-    let number = |range: std::ops::Range<usize>| -> Option<i64> {
-        std::str::from_utf8(bytes.get(range)?).ok()?.parse().ok()
-    };
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
-    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let month_days = match month {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    if !(1..=month_days).contains(&day) {
-        return None;
-    }
-    let days = days_from_civil(year, month, day)?;
-    let seconds = days
-        .checked_mul(86_400)?
-        .checked_add(hour * 3600 + minute * 60 + second)?;
-    if bytes.get(19) == Some(&b'.') {
-        let mut i = 20;
-        let start = i;
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-        if i == start {
-            return None;
-        }
-        let zone = std::str::from_utf8(bytes.get(i..)?).ok()?;
-        if zone != "Z" {
-            return None;
-        }
-    } else if bytes.get(19) != Some(&b'Z') {
-        return None;
-    }
-    Some(seconds)
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    let year = year.checked_sub(i64::from(month <= 2))?;
-    let era = year.div_euclid(400);
-    let yoe = year - era * 400;
-    let mp = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era.checked_mul(146_097)?
-        .checked_add(doe)?
-        .checked_sub(719_468)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::borrow::Cow;
     use std::io::Write;
+
+    #[test]
+    fn read_errors_do_not_return_a_partial_session() {
+        let prefix = b"{\"type\":\"session_meta\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"payload\":{\"id\":\"123e4567-e89b-12d3-a456-426614174000\",\"cwd\":\"/work\"}}\n";
+        let reader = crate::json_lines::reader_failing_after(prefix);
+        assert_eq!(
+            parse_reader(reader, 0).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_timestamps() {
+        for value in [
+            "2025-01-01T00:00:00Zjunk",
+            "2025-01-01T00-00:00Z",
+            "2025-01-01T-1:00:00Z",
+            "2025-02-29T00:00:00Z",
+            "2025-01-01T00:00:00.Z",
+            "1735787045",
+        ] {
+            assert_eq!(parse_timestamp(value), None, "{value}");
+        }
+    }
 
     #[test]
     fn scans_session_metadata_and_user_text() {
@@ -372,7 +324,7 @@ mod tests {
                 }
             });
             fs::write(&path, format!("{record}\n")).unwrap();
-            assert_eq!(parse_file(&path).is_some(), expected, "{kind}");
+            assert_eq!(parse_file(&path).unwrap().is_some(), expected, "{kind}");
         }
         let malformed_source = serde_json::json!({
             "type": "session_meta",
@@ -383,7 +335,7 @@ mod tests {
             }
         });
         fs::write(&path, format!("{malformed_source}\n")).unwrap();
-        assert!(parse_file(&path).is_some());
+        assert!(parse_file(&path).unwrap().is_some());
         fs::remove_file(path).unwrap();
     }
 }
