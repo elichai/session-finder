@@ -72,8 +72,20 @@ pub fn parse_file(path: &Path) -> io::Result<Option<Session>> {
 }
 
 fn parse_reader(id: &str, reader: impl BufRead, modified: i64) -> io::Result<Option<Session>> {
+    Ok(parse_events(Source::Copilot, id, reader, modified)?
+        .filter(|session| !session.cwd.as_os_str().is_empty()))
+}
+
+/// Parses the Copilot agent event log shared by Copilot CLI and VS Code Copilot Chat.
+/// The returned session may have an empty cwd when the log never records one.
+pub(crate) fn parse_events(
+    source: Source,
+    id: &str,
+    reader: impl BufRead,
+    modified: i64,
+) -> io::Result<Option<Session>> {
     let mut session = Session {
-        source: Source::Copilot,
+        source,
         id: id.to_owned(),
         cwd: PathBuf::new(),
         updated: modified,
@@ -162,10 +174,7 @@ fn parse_reader(id: &str, reader: impl BufRead, modified: i64) -> io::Result<Opt
         }
     }
     session.updated = updated.unwrap_or(modified);
-    Ok(
-        (started && !session.cwd.as_os_str().is_empty() && !session.search_text.is_empty())
-            .then_some(session),
-    )
+    Ok((started && !session.search_text.is_empty()).then_some(session))
 }
 
 #[cfg(test)]

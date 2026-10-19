@@ -8,8 +8,18 @@ pub(crate) struct SessionFiles {
 
 impl SessionFiles {
     pub fn new(root: &Path, accepts: fn(&Path) -> bool) -> Self {
+        Self::from_dirs([root], accepts)
+    }
+
+    pub fn from_dirs<P: AsRef<Path>>(
+        roots: impl IntoIterator<Item = P>,
+        accepts: fn(&Path) -> bool,
+    ) -> Self {
         Self {
-            directories: fs::read_dir(root).into_iter().collect(),
+            directories: roots
+                .into_iter()
+                .filter_map(|root| fs::read_dir(root).ok())
+                .collect(),
             accepts,
         }
     }

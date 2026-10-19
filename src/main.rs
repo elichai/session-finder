@@ -7,6 +7,7 @@ mod json_lines;
 mod picker;
 mod session_files;
 mod timestamp;
+mod vscode;
 
 use args::{Action, Args};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ pub enum Source {
     Codex,
     Copilot,
     Cursor,
+    VsCode,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +73,7 @@ struct History {
     codex_root: PathBuf,
     codex_archive_root: PathBuf,
     copilot_root: PathBuf,
+    vscode_roots: Vec<PathBuf>,
     cursor_db: PathBuf,
     cache_path: PathBuf,
 }
@@ -101,7 +104,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => (),
     }
     if args.action == Action::Help {
-        println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\nSearch local Claude, Codex, Copilot CLI, and Cursor sessions, most recent first.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nBoth modes use literal characters and smart case, without extended-search operators.\nEnter copies the exact resume command. Ctrl-O opens the selected session in its app. Esc cancels.\nCopilot CLI sessions resume in a terminal; use Enter or --print, not Ctrl-O or --open.\nCtrl-A toggles assistant-answer search (off initially). Ctrl-R refreshes history.\nThe bottom pane shows a highlighted matching passage. Requires fzf 0.71.0 or later.\nAssistant answers are always indexed in the private plaintext cache.\nCursor opening requires the local Session Finder helper extension.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\nSESSION_FINDER_COPILOT_ROOT overrides Copilot's session-state directory.\nOtherwise Copilot uses $COPILOT_HOME/session-state or ~/.copilot/session-state.\nSESSION_FINDER_CURSOR_DB overrides Cursor's local history database.");
+        println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\nSearch local Claude, Codex, Copilot CLI, VS Code Copilot Chat, and Cursor sessions, most recent first.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nBoth modes use literal characters and smart case, without extended-search operators.\nEnter copies the exact resume command. Ctrl-O opens the selected session in its app. Esc cancels.\nCopilot CLI sessions resume in a terminal; use Enter or --print, not Ctrl-O or --open.\nVS Code Copilot Chat sessions reopen from VS Code's Chat sessions view; Enter copies `code PWD` when the workspace folder is known.\nCtrl-A toggles assistant-answer search (off initially). Ctrl-R refreshes history.\nThe bottom pane shows a highlighted matching passage. Requires fzf 0.71.0 or later.\nAssistant answers are always indexed in the private plaintext cache.\nCursor opening requires the local Session Finder helper extension.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\nSESSION_FINDER_COPILOT_ROOT overrides Copilot's session-state directory.\nOtherwise Copilot uses $COPILOT_HOME/session-state or ~/.copilot/session-state.\nSESSION_FINDER_VSCODE_ROOT sets VS Code workspaceStorage directories (colon-separated).\nOtherwise VS Code uses the desktop, Insiders, and Remote server locations under $HOME.\nSESSION_FINDER_CURSOR_DB overrides Cursor's local history database.");
         return Ok(());
     }
 
@@ -141,7 +144,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if sessions.is_empty() {
-        return Err("no Claude, Codex, Copilot CLI, or Cursor sessions found".into());
+        return Err(
+            "no Claude, Codex, Copilot CLI, VS Code Copilot Chat, or Cursor sessions found".into(),
+        );
     }
     let Some((selected, action)) = picker::choose(&sessions, args.fuzzy)? else {
         return Ok(());
@@ -195,6 +200,13 @@ impl History {
             copilot_root: std::env::var_os("SESSION_FINDER_COPILOT_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| path("COPILOT_HOME", ".copilot").join("session-state")),
+            vscode_roots: match std::env::var_os("SESSION_FINDER_VSCODE_ROOT") {
+                Some(roots) => std::env::split_paths(&roots).collect(),
+                None => vscode::DEFAULT_ROOTS
+                    .iter()
+                    .map(|root| home.join(root))
+                    .collect(),
+            },
             cursor_db: path(
                 "SESSION_FINDER_CURSOR_DB",
                 "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
@@ -217,7 +229,7 @@ impl History {
         let mut previous = old.entries;
         let mut next = HashMap::with_capacity(previous.len());
         let mut changed = 0;
-        for (root, files, parse, archived) in [
+        let mut roots = vec![
             (
                 &self.claude_root,
                 claude::session_files as fn(&Path) -> session_files::SessionFiles,
@@ -242,7 +254,16 @@ impl History {
                 copilot::parse_file,
                 false,
             ),
-        ] {
+        ];
+        roots.extend(self.vscode_roots.iter().map(|root| {
+            (
+                root,
+                vscode::session_files as _,
+                vscode::parse_file as _,
+                false,
+            )
+        }));
+        for (root, files, parse, archived) in roots {
             for path in files(root) {
                 let Ok(meta) = fs::metadata(&path) else {
                     continue;
@@ -413,13 +434,16 @@ fn gui_command(session: &Session) -> Result<Command, &'static str> {
     if session.source == Source::Copilot {
         return Err("Copilot CLI has no supported desktop session link; use Enter or --print to copy its resume command");
     }
+    if session.source == Source::VsCode {
+        return Err("VS Code Copilot Chat has no supported session link; reopen it from VS Code's Chat sessions view");
+    }
     if !codex::is_uuid(&session.id) {
         return Err("session has an invalid ID");
     }
     let mut command = match session.source {
         Source::Claude => Command::new("claude"),
         Source::Codex | Source::Cursor => Command::new("open"),
-        Source::Copilot => unreachable!(),
+        Source::Copilot | Source::VsCode => unreachable!(),
     };
     match session.source {
         Source::Claude => {
@@ -433,7 +457,7 @@ fn gui_command(session: &Session) -> Result<Command, &'static str> {
         Source::Cursor => {
             command.arg(cursor_url(session));
         }
-        Source::Copilot => unreachable!(),
+        Source::Copilot | Source::VsCode => unreachable!(),
     }
     Ok(command)
 }
@@ -490,6 +514,7 @@ fn source_name(source: Source) -> &'static str {
         Source::Codex => "Codex",
         Source::Copilot => "Copilot",
         Source::Cursor => "Cursor",
+        Source::VsCode => "VSCode",
     }
 }
 
@@ -499,6 +524,7 @@ fn display_source(session: &Session) -> &'static str {
         (Source::Codex, true) => "Codex*",
         (Source::Cursor, true) => "Cursor*",
         (Source::Copilot, true) => "Copilot*",
+        (Source::VsCode, true) => "VSCode*",
         (source, false) => source_name(source),
     }
 }
@@ -561,10 +587,19 @@ fn resume_command(session: &Session) -> String {
         Source::Codex => format!("codex resume {id} -C {cwd}"),
         Source::Copilot => ["cd -- ", &cwd, " && copilot --resume=", &id].concat(),
         Source::Cursor => ["open ", &shell_quote(&cursor_url(session))].concat(),
+        // Chats cannot be targeted from the CLI; open the workspace, then pick the chat.
+        Source::VsCode if session.cwd.as_os_str().is_empty() => format!(
+            "# VS Code Copilot Chat {}: reopen it from VS Code's Chat sessions view",
+            session.id
+        ),
+        Source::VsCode => ["code ", &cwd].concat(),
     }
 }
 
 fn warn_if_missing(session: &Session) {
+    if session.source == Source::VsCode && session.cwd.as_os_str().is_empty() {
+        return;
+    }
     if !session.cwd.is_dir() {
         eprintln!(
             "Recorded working directory is missing: {}",
