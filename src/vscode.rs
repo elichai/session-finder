@@ -42,6 +42,8 @@ pub struct Context {
     pub title: String,
     pub participants: Vec<String>,
     pub format: StorageFormat,
+    #[serde(skip)]
+    pub storage: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -154,6 +156,10 @@ pub fn resolve_context(path: &Path, session: &mut Session) {
         .and_then(|workspace| workspace.workspace.as_deref())
         .and_then(file_uri_path)
         .or_else(|| folder.clone());
+    // A working-directory fallback does not identify the store owning a native chat.
+    context.storage = storage
+        .filter(|_| context.target.is_some())
+        .map(Path::to_path_buf);
     if session.cwd.as_os_str().is_empty() {
         session.cwd = folder.unwrap_or_default();
     }

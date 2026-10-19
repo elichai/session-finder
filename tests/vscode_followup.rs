@@ -164,9 +164,10 @@ fn native_chat_history_supports_multiple_extensions_and_deduplicates_copilot() {
     assert!(rows.contains("Saved native answer"));
     assert!(rows.contains("Vendor answer"));
     assert!(!rows.contains("private"));
-    assert_eq!(
-        String::from_utf8(run(&root, &["--print", other]).stdout).unwrap(),
-        "code '/tmp/native'\n"
+    let command = String::from_utf8(run(&root, &["--print", other]).stdout).unwrap();
+    assert!(
+        command.ends_with(&[" --open 'VSCode:", other, "'\n"].concat()),
+        "{command}"
     );
     fs::remove_dir_all(root).unwrap();
 }

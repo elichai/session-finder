@@ -82,5 +82,33 @@ fn print_reports_missing_and_ambiguous_ids_without_selecting_a_session() {
         assert!(output.stdout.is_empty());
         assert!(String::from_utf8(output.stderr).unwrap().contains(expected));
     }
+    let collision = root.join("copilot").join(format!("Claude:{id}"));
+    fs::create_dir_all(&collision).unwrap();
+    fs::write(collision.join("events.jsonl"), [
+        serde_json::json!({"type": "session.start", "data": {"sessionId": format!("Claude:{id}"), "context": {"cwd": "/work"}}}).to_string(),
+        "\n".to_owned(),
+        serde_json::json!({"type": "user.message", "data": {"content": "Copilot request"}}).to_string(),
+        "\n".to_owned(),
+    ].concat()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_session-finder"))
+        .args(["--print", &format!("Claude:{id}")])
+        .env("SESSION_FINDER_CLAUDE_ROOT", root.join("claude"))
+        .env("SESSION_FINDER_CODEX_ROOT", root.join("codex"))
+        .env("SESSION_FINDER_CODEX_ARCHIVE_ROOT", root.join("missing"))
+        .env("SESSION_FINDER_COPILOT_ROOT", root.join("copilot"))
+        .env("SESSION_FINDER_VSCODE_ROOT", root.join("missing"))
+        .env("SESSION_FINDER_CURSOR_DB", root.join("missing.db"))
+        .env("SESSION_FINDER_CACHE", root.join("index.json"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("cd -- '/work' && claude --resume '{id}'\n")
+    );
     fs::remove_dir_all(root).unwrap();
 }

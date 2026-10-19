@@ -232,7 +232,7 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
     }
     if fields[0].starts_with("VSCode:") {
         output.push_str(
-            "Enter opens the workspace; select the chat in VS Code's Chat sessions view.\n",
+            "Ctrl-O restores a saved native chat in its workspace. Enter copies the resume command; recovery-only chats use a workspace command.\n",
         );
     }
     if query.is_empty() {
@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn vscode_selections_require_uuid_ids_and_explain_chat_view() {
+    fn vscode_selections_require_uuid_ids_and_explain_opening() {
         let id = "7fee6c13-604d-48d4-846c-7dc8ca593940";
         assert_eq!(
             selection(
@@ -349,7 +349,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(text.contains("Chat sessions view"));
+        assert!(text.contains("Ctrl-O restores a saved native chat"));
     }
 
     #[test]

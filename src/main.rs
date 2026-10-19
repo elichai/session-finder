@@ -9,6 +9,7 @@ mod session_files;
 mod timestamp;
 mod vscode;
 mod vscode_native;
+mod vscode_open;
 
 use args::{Action, Args};
 use serde::{Deserialize, Serialize};
@@ -115,8 +116,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Both modes use literal characters and smart case, without extended-search operators.\n",
             "Enter copies the resume command. Ctrl-O opens a supported app session. Esc cancels.\n",
             "Copilot CLI sessions resume in a terminal; use Enter or --print.\n",
-            "VS Code sessions reopen from its Chat sessions view. Enter copies a workspace-opening command\n",
-            "using code or code-insiders, preserving .code-workspace files.\n",
+            "VS Code native chats open in their recorded workspace, including saved .code-workspace files.\n",
+            "Enter copies a resume command; Ctrl-O opens the exact native chat without a helper extension.\n",
+            "Recovery-only transcripts and unknown workspaces retain workspace-opening commands.\n",
             "VS Code titles, workspace targets, and participant IDs are always searchable.\n",
             "Ctrl-A toggles assistant-answer search (off initially). Ctrl-R refreshes history.\n",
             "The bottom pane shows a highlighted matching passage. Requires fzf 0.71.0 or later.\n",
@@ -155,7 +157,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Action::Print(id) | Action::Open(id) = &args.action {
-        let mut matches = sessions.iter().filter(|session| session.id == *id);
+        let qualified = id.contains(':')
+            && sessions
+                .iter()
+                .any(|session| picker::identity(session) == *id);
+        let mut matches = sessions.iter().filter(|session| {
+            if qualified {
+                picker::identity(session) == *id
+            } else {
+                session.id == *id
+            }
+        });
         let session = match (matches.next(), matches.count()) {
             (Some(session), 0) => session,
             (first, remaining) => {
@@ -495,7 +507,7 @@ fn gui_command(session: &Session) -> Result<Command, &'static str> {
         return Err("Copilot CLI has no supported desktop session link; use Enter or --print to copy its resume command");
     }
     if session.source == Source::VsCode {
-        return Err("VS Code chat has no supported session link; reopen it from VS Code's Chat sessions view");
+        return vscode_open::command(session, true);
     }
     if !codex::is_uuid(&session.id) {
         return Err("session has an invalid ID");
@@ -524,6 +536,14 @@ fn gui_command(session: &Session) -> Result<Command, &'static str> {
 
 fn open_gui(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
     warn_if_missing(session);
+    if session.source == Source::VsCode {
+        vscode_open::open(session)?;
+        println!(
+            "Requested VS Code session {} in its recorded workspace.",
+            session.id
+        );
+        return Ok(());
+    }
     let mut command = gui_command(session)?;
     if session.source == Source::Claude && !io::stdout().is_terminal() {
         // Claude's desktop handoff rejects redirected output, including CLI wrappers.
@@ -555,8 +575,13 @@ fn cursor_url(session: &Session) -> String {
     url.push_str(PREFIX);
     url.push_str(&session.id);
     url.push_str("&cwd=");
+    push_url_encoded(&mut url, cwd);
+    url
+}
+
+fn push_url_encoded(url: &mut String, bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for &byte in cwd {
+    for &byte in bytes {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
             url.push(char::from(byte));
         } else {
@@ -565,7 +590,6 @@ fn cursor_url(session: &Session) -> String {
             url.push(char::from(HEX[usize::from(byte & 15)]));
         }
     }
-    url
 }
 
 fn source_name(source: Source) -> &'static str {
@@ -647,7 +671,15 @@ fn resume_command(session: &Session) -> String {
         Source::Codex => format!("codex resume {id} -C {cwd}"),
         Source::Copilot => ["cd -- ", &cwd, " && copilot --resume=", &id].concat(),
         Source::Cursor => ["open ", &shell_quote(&cursor_url(session))].concat(),
-        // Chats cannot be targeted from the CLI; open the workspace, then pick the chat.
+        Source::VsCode if vscode_open::command(session, true).is_ok() => {
+            let executable = std::env::current_exe().unwrap_or_else(|_| "session-finder".into());
+            [
+                &shell_quote(&executable.to_string_lossy()),
+                " --open ",
+                &shell_quote(&picker::identity(session)),
+            ]
+            .concat()
+        }
         Source::VsCode
             if session.cwd.as_os_str().is_empty()
                 && session
