@@ -1,12 +1,12 @@
 # session-finder
 
-Find a local Claude Code, Codex, or Cursor conversation by its working directory or by text you wrote in it. The panel starts with the most recently used session. Search matches the typed phrase; run `session-finder --fuzzy` for looser subsequence matching.
+Find a local Claude Code, Codex, GitHub Copilot CLI, or Cursor conversation by its working directory or by text you wrote in it. The panel starts with the most recently used session. Search matches the typed phrase; run `session-finder --fuzzy` for looser subsequence matching.
 
 `fzf` still reads `FZF_DEFAULT_OPTS` for your preferred appearance and key bindings. The tool sets its search mode explicitly. Both modes use literal characters and smart case: lowercase queries ignore case; a query containing uppercase letters is case-sensitive. Accents are distinct, and extended-search operators are disabled, including with `--fuzzy`.
 
 ## Install
 
-Requires **fzf 0.71.0 or later**. The picker uses field-based selection tracking across refreshes, added in fzf 0.71.0. SQLite is bundled into the binary; no system SQLite installation is needed. Install the Claude/Codex CLI to resume those providers in a terminal.
+Requires **fzf 0.71.0 or later**. The picker uses field-based selection tracking across refreshes, added in fzf 0.71.0. SQLite is bundled into the binary; no system SQLite installation is needed. Install the Claude, Codex, or Copilot CLI to resume that provider in a terminal.
 
 ### macOS (Homebrew)
 
@@ -26,7 +26,7 @@ fzf --version
 
 Distribution packages can be older than 0.71.0. If yours is, install a recent binary from the [official fzf releases](https://github.com/junegunn/fzf/releases) and put it ahead of the older binary in `PATH`.
 
-Linux supports the Claude/Codex history panel and printed terminal resume commands. Clipboard copying and Codex/Cursor GUI opening currently use macOS tools (`pbcopy` and `open`). The Cursor helper installation instructions below also target macOS. Cursor's default database path is specific to macOS; use `SESSION_FINDER_CURSOR_DB` to point at its database on Linux.
+Linux supports the Claude/Codex/Copilot history panel and printed terminal resume commands. Clipboard copying and Codex/Cursor GUI opening currently use macOS tools (`pbcopy` and `open`). The Cursor helper installation instructions below also target macOS. Cursor's default database path is specific to macOS; use `SESSION_FINDER_CURSOR_DB` to point at its database on Linux.
 
 ### Prebuilt binaries
 
@@ -76,6 +76,8 @@ Press **Ctrl-R** to refresh history without closing the panel. The query and ass
 
 For Claude, Ctrl-O uses `claude --desktop --resume ID` in the recorded directory. This requires Claude Code 2.1.285 or later, the Claude Desktop app, and a Claude subscription. Claude rejects a session that is still running in another terminal. Codex uses its desktop session link; terminal resume restores an archived Codex chat to active history.
 
+For GitHub Copilot CLI, Enter copies `cd -- 'PWD' && copilot --resume='ID'`. Both the working directory and session ID are shell-quoted. Copilot sessions use terminal resume; Ctrl-O and `--open` report that desktop opening is unavailable. This reads Copilot CLI history, not the separate VS Code Copilot Chat history.
+
 For Cursor, both Enter's copied command and Ctrl-O use the desktop app, through the small local Session Finder helper extension. They target the existing chat ID; they do not start a CLI conversation. Install the helper once from the repository:
 
 ```sh
@@ -98,11 +100,13 @@ session-finder --fuzzy             # looser matching
 
 ## Index and automatic updates
 
-The Claude/Codex index is saved at **`~/.cache/session-finder/index.json`** on both macOS and Linux. It stores each source file's size and modification time, plus the session ID, working directory, activity time, preview, user messages, and assistant answers. It is a local JSON cache, not a background service.
+The Claude/Codex/Copilot index is saved at **`~/.cache/session-finder/index.json`** on both macOS and Linux. It stores each source file's size and modification time, plus the session ID, working directory, activity time, preview, user messages, and assistant answers. It is a local JSON cache, not a background service.
 
 The first run reads Claude history from `~/.claude/projects`, Codex history from `~/.codex/sessions`, and archived Codex history from `~/.codex/archived_sessions`. Internal Codex review and subagent runs are excluded. Each later launch reuses unchanged entries, reparses new or changed files, and drops deleted files automatically. **No manual rebuild is needed for normal use.** `--rebuild` forces a full reparse; a missing, invalid, or incompatible cache is rebuilt automatically.
 
-If reading a Claude or Codex session file fails, the load or refresh stops with an error and leaves the existing cache unchanged. Files deleted during indexing are skipped.
+Copilot CLI history is read from `~/.copilot/session-state/<id>/events.jsonl`, or `$COPILOT_HOME/session-state` when configured. The reader indexes user messages and assistant answers, uses the latest recorded working directory and event timestamp, and excludes subagent messages, tool output, and reasoning. Custom session IDs are supported. Sessions without a recorded absolute directory or a user message are skipped. The older `history-session-state` format is not supported.
+
+If reading a Claude, Codex, or Copilot session file fails, the load or refresh stops with an error and leaves the existing cache unchanged. Files deleted during indexing are skipped.
 
 Cursor's desktop SQLite database is read on every launch, using a consistent read-only snapshot that includes committed WAL updates. Session metadata supplies the exact workspace or worktree path and latest activity time. Subagent chats and empty drafts are excluded. Missing Cursor history is fine; a database error is reported while the other providers remain searchable.
 
@@ -117,6 +121,8 @@ SESSION_FINDER_CACHE=/path/to/private/index.json session-finder
 ```
 
 `SESSION_FINDER_CLAUDE_ROOT`, `SESSION_FINDER_CODEX_ROOT`, and `SESSION_FINDER_CODEX_ARCHIVE_ROOT` override history locations. `SESSION_FINDER_CURSOR_DB` overrides the Cursor database path, which defaults to `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`.
+
+`SESSION_FINDER_COPILOT_ROOT` overrides the Copilot `session-state` directory directly. When resuming sessions from a non-default Copilot home, keep `COPILOT_HOME` set in the terminal where you run the copied command.
 
 ## Tests
 

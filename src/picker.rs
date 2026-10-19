@@ -126,7 +126,11 @@ fn selection(status: ExitStatus, output: &[u8]) -> io::Result<Option<(String, Se
         .next()
         .ok_or_else(|| io::Error::other("fzf returned no selection"))?;
     let valid = key.split_once(':').is_some_and(|(source, id)| {
-        matches!(source, "Claude" | "Codex" | "Cursor") && crate::codex::is_uuid(id)
+        if source == "Copilot" {
+            !id.is_empty() && !id.chars().any(char::is_control)
+        } else {
+            matches!(source, "Claude" | "Codex" | "Cursor") && crate::codex::is_uuid(id)
+        }
     });
     if !valid || lines.next().is_some() {
         return Err(io::Error::other("fzf returned an invalid selection"));
@@ -217,6 +221,9 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
     }
     let fields = values.map(Option::unwrap);
     let mut output = format!("PWD: {}\nID: {}\n\n", fields[4], fields[5]);
+    if fields[0].starts_with("Copilot:") {
+        output.push_str("Copilot CLI: Enter copies a terminal resume command; desktop opening is unavailable.\n");
+    }
     if query.is_empty() {
         output.push_str(&format!("Opening user message: {}\n", fields[2]));
         return Ok(output);
@@ -274,6 +281,29 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn copilot_selections_accept_custom_ids_and_explain_terminal_resume() {
+        assert_eq!(
+            selection(ExitStatus::from_raw(0), b"\nCopilot:work-task_123\n").unwrap(),
+            Some(("Copilot:work-task_123".into(), SelectionAction::Copy))
+        );
+        for value in [
+            b"\nCopilot:\n".as_slice(),
+            b"\nCopilot:a\tb\n",
+            b"\nCopilot:a\nb\n",
+        ] {
+            assert!(selection(ExitStatus::from_raw(0), value).is_err());
+        }
+        let text = preview(
+            "Copilot:work-task_123\tnow\topening\trequest\t/work\twork-task_123\tanswer",
+            "",
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(text.contains("Enter copies a terminal resume command"));
+    }
 
     #[test]
     fn cancellation_is_normal_but_picker_errors_and_signals_are_errors() {
