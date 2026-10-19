@@ -129,7 +129,7 @@ fn selection(status: ExitStatus, output: &[u8]) -> io::Result<Option<(String, Se
         if source == "Copilot" {
             !id.is_empty() && !id.chars().any(char::is_control)
         } else {
-            matches!(source, "Claude" | "Codex" | "Cursor") && crate::codex::is_uuid(id)
+            matches!(source, "Claude" | "Codex" | "Cursor" | "VSCode") && crate::codex::is_uuid(id)
         }
     });
     if !valid || lines.next().is_some() {
@@ -224,6 +224,9 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
     if fields[0].starts_with("Copilot:") {
         output.push_str("Copilot CLI: Enter copies a terminal resume command; desktop opening is unavailable.\n");
     }
+    if fields[0].starts_with("VSCode:") {
+        output.push_str("VS Code Copilot Chat: reopen the chat from VS Code's Chat sessions view; Enter copies `code PWD` when the workspace folder is known.\n");
+    }
     if query.is_empty() {
         output.push_str(&format!("Opening user message: {}\n", fields[2]));
         return Ok(output);
@@ -303,6 +306,28 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("Enter copies a terminal resume command"));
+    }
+
+    #[test]
+    fn vscode_selections_require_uuid_ids_and_explain_chat_view() {
+        let id = "7fee6c13-604d-48d4-846c-7dc8ca593940";
+        assert_eq!(
+            selection(
+                ExitStatus::from_raw(0),
+                format!("\nVSCode:{id}\n").as_bytes()
+            )
+            .unwrap(),
+            Some((format!("VSCode:{id}"), SelectionAction::Copy))
+        );
+        assert!(selection(ExitStatus::from_raw(0), b"\nVSCode:work-task_123\n").is_err());
+        let text = preview(
+            &format!("VSCode:{id}\tnow\topening\trequest\t/work\t{id}\tanswer"),
+            "",
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(text.contains("Chat sessions view"));
     }
 
     #[test]

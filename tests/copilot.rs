@@ -32,6 +32,7 @@ fn copilot_history_is_searchable_resumable_and_refreshed_automatically() {
             .env("HOME", &root)
             .env("COPILOT_HOME", root.join("copilot"))
             .env_remove("SESSION_FINDER_COPILOT_ROOT")
+            .env("SESSION_FINDER_VSCODE_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CLAUDE_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CODEX_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CODEX_ARCHIVE_ROOT", root.join("missing"))
