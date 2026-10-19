@@ -187,6 +187,7 @@ fn scan_connection(connection: &Connection) -> rusqlite::Result<Vec<Session>> {
             search_text: String::new(),
             assistant_text: String::new(),
             preview: String::new(),
+            vscode: None,
             archived: row
                 .get::<_, Option<bool>>(4)?
                 .unwrap_or(composer.is_archived),

@@ -24,18 +24,25 @@ fn preview_uses_the_query_and_only_includes_assistant_when_enabled() {
         );
         String::from_utf8(output.stdout).unwrap()
     };
-    let output = preview("timing attack", "2..6", false);
+    let output = preview("timing attack", "2..6,8", false);
     assert!(output.contains("User"));
     assert!(
         output.contains("\x1b[1;33mtiming attack\x1b[0m"),
         "{output}"
     );
     assert!(!output.contains("secret"));
-    assert!(!preview("secret", "2..6", false).contains("secret"));
-    let output = preview("secret", "2..7", false);
+    assert!(!preview("secret", "2..6,8", false).contains("secret"));
+    let output = preview("secret", "2..8", false);
     assert!(output.contains("Assistant"));
     assert!(output.contains("\x1b[1;33msecret\x1b[0m"));
-    assert!(preview("tmng", "2..6", true).contains("\x1b[1;33mt"));
+    assert!(preview("tmng", "2..6,8", true).contains("\x1b[1;33mt"));
+    fs::write(&path, "VSCode:123e4567-e89b-12d3-a456-426614174000\tnow VSCode /work\topening\tuser request\t/work\t123e4567-e89b-12d3-a456-426614174000\tsecret assistant answer\tVS Code • Workspace: /work/team.code-workspace • Participants: Vendor.Helper\n").unwrap();
+    let output = preview("Vendor.Helper", "2..6,8", false);
+    assert!(output.contains("Matching Session details:"));
+    assert!(output.contains("\x1b[1;33mVendor.Helper\x1b[0m"));
+    assert!(!output.contains("secret assistant answer"));
+    assert!(!preview("secret", "2..6,8", false).contains("secret assistant answer"));
+    assert!(preview("secret", "2..8", false).contains("Matching Assistant:"));
     fs::remove_file(path).unwrap();
 }
 

@@ -95,7 +95,7 @@ fn vscode_copilot_chat_history_is_searchable_with_and_without_workspace_metadata
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        format!("# VS Code Copilot Chat {REMOTE}: reopen it from VS Code's Chat sessions view\n")
+        format!("# VS Code chat {REMOTE}: reopen it from VS Code's Chat sessions view\n")
     );
 
     let rows = String::from_utf8(run(&["--picker-rows"], false).stdout).unwrap();
@@ -108,7 +108,7 @@ fn vscode_copilot_chat_history_is_searchable_with_and_without_workspace_metadata
     assert!(!output.status.success());
     assert!(String::from_utf8(output.stderr)
         .unwrap()
-        .contains("VS Code Copilot Chat"));
+        .contains("VS Code chat"));
 
     fs::write(
         &local_file,

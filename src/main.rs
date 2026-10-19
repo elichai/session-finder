@@ -8,6 +8,7 @@ mod picker;
 mod session_files;
 mod timestamp;
 mod vscode;
+mod vscode_native;
 
 use args::{Action, Args};
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u8 = 5;
+const CACHE_VERSION: u8 = 6;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Source {
@@ -53,6 +54,8 @@ pub struct Session {
     pub preview: String,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub vscode: Option<vscode::Context>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -104,7 +107,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => (),
     }
     if args.action == Action::Help {
-        println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\nSearch local Claude, Codex, Copilot CLI, VS Code Copilot Chat, and Cursor sessions, most recent first.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nBoth modes use literal characters and smart case, without extended-search operators.\nEnter copies the exact resume command. Ctrl-O opens the selected session in its app. Esc cancels.\nCopilot CLI sessions resume in a terminal; use Enter or --print, not Ctrl-O or --open.\nVS Code Copilot Chat sessions reopen from VS Code's Chat sessions view; Enter copies `code PWD` when the workspace folder is known.\nCtrl-A toggles assistant-answer search (off initially). Ctrl-R refreshes history.\nThe bottom pane shows a highlighted matching passage. Requires fzf 0.71.0 or later.\nAssistant answers are always indexed in the private plaintext cache.\nCursor opening requires the local Session Finder helper extension.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\nSESSION_FINDER_COPILOT_ROOT overrides Copilot's session-state directory.\nOtherwise Copilot uses $COPILOT_HOME/session-state or ~/.copilot/session-state.\nSESSION_FINDER_VSCODE_ROOT sets VS Code workspaceStorage directories (colon-separated).\nOtherwise VS Code uses the desktop, Insiders, and Remote server locations under $HOME.\nSESSION_FINDER_CURSOR_DB overrides Cursor's local history database.");
+        print!(concat!(
+            "Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\n",
+            "Search local Claude, Codex, Copilot CLI, VS Code chat, and Cursor sessions, most recent first.\n",
+            "VS Code includes Copilot and other native Chat participants.\n",
+            "Search matches the typed phrase; --fuzzy enables loose subsequence matching.\n",
+            "Both modes use literal characters and smart case, without extended-search operators.\n",
+            "Enter copies the resume command. Ctrl-O opens a supported app session. Esc cancels.\n",
+            "Copilot CLI sessions resume in a terminal; use Enter or --print.\n",
+            "VS Code sessions reopen from its Chat sessions view. Enter copies a workspace-opening command\n",
+            "using code or code-insiders, preserving .code-workspace files.\n",
+            "VS Code titles, workspace targets, and participant IDs are always searchable.\n",
+            "Ctrl-A toggles assistant-answer search (off initially). Ctrl-R refreshes history.\n",
+            "The bottom pane shows a highlighted matching passage. Requires fzf 0.71.0 or later.\n",
+            "Assistant answers are always indexed in the private plaintext cache.\n",
+            "Cursor opening requires the local Session Finder helper extension.\n\n",
+            "SESSION_FINDER_CACHE sets the private cache file path.\n",
+            "SESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\n",
+            "SESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\n",
+            "SESSION_FINDER_COPILOT_ROOT overrides Copilot's session-state directory.\n",
+            "Otherwise Copilot uses $COPILOT_HOME/session-state or ~/.copilot/session-state.\n",
+            "SESSION_FINDER_VSCODE_ROOT sets VS Code workspaceStorage directories (colon-separated).\n",
+            "Otherwise VS Code uses desktop, Insiders, and Remote server locations under $HOME.\n",
+            "The sibling globalStorage/emptyWindowChatSessions directory is also read.\n",
+            "SESSION_FINDER_CURSOR_DB overrides Cursor's local history database.\n",
+        ));
         return Ok(());
     }
 
@@ -144,9 +171,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if sessions.is_empty() {
-        return Err(
-            "no Claude, Codex, Copilot CLI, VS Code Copilot Chat, or Cursor sessions found".into(),
-        );
+        return Err("no Claude, Codex, Copilot CLI, VS Code chat, or Cursor sessions found".into());
     }
     let Some((selected, action)) = picker::choose(&sessions, args.fuzzy)? else {
         return Ok(());
@@ -342,8 +367,15 @@ impl History {
         let sessions = merge_sessions(
             cache
                 .entries
-                .into_values()
-                .filter_map(|entry| entry.session)
+                .into_iter()
+                .filter_map(|(path, entry)| {
+                    entry.session.map(|mut session| {
+                        if session.source == Source::VsCode {
+                            vscode::resolve_context(Path::new(&path), &mut session);
+                        }
+                        session
+                    })
+                })
                 .chain(cursor_sessions),
         );
         if debug {
@@ -368,6 +400,27 @@ fn merge_sessions(parts: impl IntoIterator<Item = Session>) -> Vec<Session> {
                 merged.insert(key, part);
             }
             Some(existing) => {
+                if part.source == Source::VsCode {
+                    let candidate = part.vscode.as_ref();
+                    let current = existing.vscode.as_ref();
+                    let candidate_key = (
+                        candidate
+                            .map_or(vscode::StorageFormat::Transcript, |context| context.format),
+                        part.updated,
+                        candidate.and_then(|context| context.target.as_ref()),
+                        candidate.map(|context| context.editor.command()),
+                    );
+                    let current_key = (
+                        current.map_or(vscode::StorageFormat::Transcript, |context| context.format),
+                        existing.updated,
+                        current.and_then(|context| context.target.as_ref()),
+                        current.map(|context| context.editor.command()),
+                    );
+                    if candidate_key > current_key {
+                        *existing = part;
+                    }
+                    continue;
+                }
                 if part.updated > existing.updated {
                     std::mem::swap(existing, &mut part);
                 }
@@ -390,7 +443,14 @@ fn merge_sessions(parts: impl IntoIterator<Item = Session>) -> Vec<Session> {
             }
         }
     }
-    let mut sessions: Vec<_> = merged.into_values().collect();
+    let mut sessions: Vec<_> = merged
+        .into_values()
+        .filter(|session| {
+            session.source != Source::VsCode
+                || !session.search_text.is_empty()
+                || !session.assistant_text.is_empty()
+        })
+        .collect();
     sessions.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.id.cmp(&b.id)));
     sessions
 }
@@ -435,7 +495,7 @@ fn gui_command(session: &Session) -> Result<Command, &'static str> {
         return Err("Copilot CLI has no supported desktop session link; use Enter or --print to copy its resume command");
     }
     if session.source == Source::VsCode {
-        return Err("VS Code Copilot Chat has no supported session link; reopen it from VS Code's Chat sessions view");
+        return Err("VS Code chat has no supported session link; reopen it from VS Code's Chat sessions view");
     }
     if !codex::is_uuid(&session.id) {
         return Err("session has an invalid ID");
@@ -588,17 +648,45 @@ fn resume_command(session: &Session) -> String {
         Source::Copilot => ["cd -- ", &cwd, " && copilot --resume=", &id].concat(),
         Source::Cursor => ["open ", &shell_quote(&cursor_url(session))].concat(),
         // Chats cannot be targeted from the CLI; open the workspace, then pick the chat.
-        Source::VsCode if session.cwd.as_os_str().is_empty() => format!(
-            "# VS Code Copilot Chat {}: reopen it from VS Code's Chat sessions view",
-            session.id
-        ),
-        Source::VsCode => ["code ", &cwd].concat(),
+        Source::VsCode
+            if session.cwd.as_os_str().is_empty()
+                && session
+                    .vscode
+                    .as_ref()
+                    .and_then(|context| context.target.as_ref())
+                    .is_none() =>
+        {
+            format!(
+                "# VS Code chat {}: reopen it from VS Code's Chat sessions view",
+                session.id
+            )
+        }
+        Source::VsCode => {
+            let context = session.vscode.as_ref();
+            let editor = context.map_or("code", |context| context.editor.command());
+            let target = context
+                .and_then(|context| context.target.as_deref())
+                .unwrap_or(&session.cwd);
+            [editor, " ", &shell_quote(&target.to_string_lossy())].concat()
+        }
     }
 }
 
 fn warn_if_missing(session: &Session) {
-    if session.source == Source::VsCode && session.cwd.as_os_str().is_empty() {
-        return;
+    if session.source == Source::VsCode {
+        if let Some(target) = session
+            .vscode
+            .as_ref()
+            .and_then(|context| context.target.as_deref())
+        {
+            if !target.exists() {
+                eprintln!("Recorded workspace is missing: {}", target.display());
+            }
+            return;
+        }
+        if session.cwd.as_os_str().is_empty() {
+            return;
+        }
     }
     if !session.cwd.is_dir() {
         eprintln!(
@@ -613,6 +701,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn migrated_vscode_copies_keep_the_known_workspace_in_either_order() {
+        let empty = Session {
+            source: Source::VsCode,
+            id: "11111111-2222-4333-8444-555555555555".into(),
+            cwd: PathBuf::new(),
+            updated: 123,
+            search_text: "request".into(),
+            assistant_text: String::new(),
+            preview: "request".into(),
+            archived: false,
+            vscode: Some(vscode::Context {
+                format: vscode::StorageFormat::Journal,
+                ..Default::default()
+            }),
+        };
+        let mut attached = empty.clone();
+        attached.cwd = "/work".into();
+        attached.vscode.as_mut().unwrap().target = Some("/work".into());
+        for parts in [vec![empty.clone(), attached.clone()], vec![attached, empty]] {
+            let merged = merge_sessions(parts);
+            assert_eq!(merged.len(), 1);
+            assert_eq!(resume_command(&merged[0]), "code '/work'");
+        }
+    }
+
+    #[test]
     fn resume_command_quotes_untrusted_cwd() {
         let session = Session {
             source: Source::Claude,
@@ -623,6 +737,7 @@ mod tests {
             assistant_text: String::new(),
             preview: String::new(),
             archived: false,
+            vscode: None,
         };
         assert_eq!(
             resume_command(&session),
@@ -642,6 +757,7 @@ mod tests {
                 assistant_text: "earlier answer".into(),
                 preview: "earlier".into(),
                 archived: false,
+                vscode: None,
             },
             Session {
                 source: Source::Codex,
@@ -652,6 +768,7 @@ mod tests {
                 assistant_text: "later answer".into(),
                 preview: "later".into(),
                 archived: false,
+                vscode: None,
             },
         ];
         let merged = merge_sessions(parts);
@@ -674,6 +791,7 @@ mod tests {
             assistant_text: String::new(),
             preview: String::new(),
             archived: true,
+            vscode: None,
         };
         assert_eq!(resume_command(&session), "codex resume 'abc' -C '/work'");
     }
@@ -689,6 +807,7 @@ mod tests {
             assistant_text: String::new(),
             preview: String::new(),
             archived: false,
+            vscode: None,
         };
         let command = gui_command(&session).unwrap();
         assert_eq!(command.get_program(), "open");
@@ -743,6 +862,7 @@ mod tests {
                         assistant_text: "answer\tβ".into(),
                         preview: "quoted \"message\"".into(),
                         archived: true,
+                        vscode: None,
                     }),
                 },
             )]),

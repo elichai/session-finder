@@ -196,6 +196,7 @@ fn parse_reader(reader: impl BufRead, modified: i64) -> io::Result<Option<Sessio
         search_text,
         assistant_text,
         archived: false,
+        vscode: None,
     }))
 }
 

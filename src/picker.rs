@@ -10,7 +10,7 @@ const HEADER: &str = "Enter: copy • Ctrl-O: open • Esc/Ctrl-C: close • *: 
 Ctrl-R: refresh • Ctrl-A: assistant";
 
 fn includes_assistant() -> bool {
-    std::env::var("FZF_WITH_NTH").as_deref() == Ok("2..7")
+    std::env::var("FZF_WITH_NTH").as_deref() == Ok("2..8")
 }
 
 pub fn print_header() {
@@ -34,7 +34,7 @@ pub fn write_rows(sessions: &[Session], output: &mut impl Write) -> io::Result<(
     for session in sessions {
         writeln!(
             output,
-            "{}\t{:>8}  {:<7}  {:<28}\t{:<60}\t{}\t{}\t{}\t{}",
+            "{}\t{:>8}  {:<7}  {:<28}\t{:<60}\t{}\t{}\t{}\t{}\t{}",
             identity(session),
             age(session.updated),
             display_source(session),
@@ -43,7 +43,8 @@ pub fn write_rows(sessions: &[Session], output: &mut impl Write) -> io::Result<(
             clean(&session.search_text, usize::MAX),
             clean(&session.cwd.to_string_lossy(), usize::MAX),
             clean(&session.id, usize::MAX),
-            clean(&session.assistant_text, usize::MAX)
+            clean(&session.assistant_text, usize::MAX),
+            clean(&crate::vscode::details(session), usize::MAX)
         )?;
     }
     Ok(())
@@ -55,7 +56,7 @@ fn command(fuzzy: bool) -> io::Result<Command> {
     let mut picker = Command::new("fzf");
     picker.args([
         "--delimiter=\t",
-        "--with-nth=2..6",
+        "--with-nth=2..6,8",
         "--nth=..",
         "--accept-nth=1",
         "--expect=ctrl-o",
@@ -68,7 +69,7 @@ fn command(fuzzy: bool) -> io::Result<Command> {
         "--border",
         "--height=90%",
         "--prompt=Sessions> ",
-        "--preview-window=down,7,wrap",
+        "--preview-window=down,10,wrap",
         "--preview-label=Selected session",
         "--no-extended",
         "--literal",
@@ -80,7 +81,7 @@ fn command(fuzzy: bool) -> io::Result<Command> {
         "--preview={executable} --picker-preview {{f}} {} {{q}}",
         if fuzzy { "fuzzy" } else { "exact" }
     ));
-    picker.arg(format!("--bind=ctrl-a:change-with-nth(2..7|2..6)+transform-header({executable} --picker-header)+refresh-preview"));
+    picker.arg(format!("--bind=ctrl-a:change-with-nth(2..8|2..6,8)+transform-header({executable} --picker-header)+refresh-preview"));
     picker.arg(format!(
         "--bind=ctrl-r:reload-sync({executable} --picker-rows)+refresh-preview"
     ));
@@ -216,16 +217,23 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
     }
     let mut fields = row.split('\t').map(|field| clean(field, usize::MAX));
     let values: [Option<String>; 7] = std::array::from_fn(|_| fields.next());
+    let metadata = fields.next();
     if values.iter().any(Option::is_none) || fields.next().is_some() {
         return Err(io::Error::other("invalid picker row"));
     }
     let fields = values.map(Option::unwrap);
     let mut output = format!("PWD: {}\nID: {}\n\n", fields[4], fields[5]);
+    if let Some(metadata) = metadata.as_ref().filter(|text| !text.is_empty()) {
+        output.push_str(metadata);
+        output.push('\n');
+    }
     if fields[0].starts_with("Copilot:") {
         output.push_str("Copilot CLI: Enter copies a terminal resume command; desktop opening is unavailable.\n");
     }
     if fields[0].starts_with("VSCode:") {
-        output.push_str("VS Code Copilot Chat: reopen the chat from VS Code's Chat sessions view; Enter copies `code PWD` when the workspace folder is known.\n");
+        output.push_str(
+            "Enter opens the workspace; select the chat in VS Code's Chat sessions view.\n",
+        );
     }
     if query.is_empty() {
         output.push_str(&format!("Opening user message: {}\n", fields[2]));
@@ -243,23 +251,37 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
             return Ok(output);
         }
     }
-    let searchable = &fields[1..if assistant { 7 } else { 6 }];
-    let Some(positions) = match_positions(&searchable.join("\t"), query, fuzzy) else {
+    let searchable: Vec<_> = fields[1..if assistant { 7 } else { 6 }]
+        .iter()
+        .chain(metadata.as_ref())
+        .collect();
+    let Some(positions) = match_positions(
+        &searchable
+            .iter()
+            .map(|text| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\t"),
+        query,
+        fuzzy,
+    ) else {
         output.push_str(&format!("Opening user message: {}\n", fields[2]));
         return Ok(output);
     };
     let mut offset = 0;
     let mut message_match = false;
-    for (label, text) in [
+    let labels = [
         "Session",
         "Opening user message",
         "User",
         "PWD",
         "ID",
         "Assistant",
-    ]
-    .iter()
-    .zip(searchable)
+    ];
+    for (label, text) in labels
+        .iter()
+        .take(if assistant { 6 } else { 5 })
+        .chain(std::iter::once(&"Session details"))
+        .zip(searchable)
     {
         let len = text.chars().count();
         let start = positions.partition_point(|&position| position < offset);
@@ -405,8 +427,8 @@ mod tests {
     }
 
     #[test]
-    fn picker_rows_require_seven_fields_but_allow_an_empty_assistant_field() {
-        for row in ["a\tb\tc\td\te\tf", "a\tb\tc\td\te\tf\tg\th"] {
+    fn picker_rows_accept_optional_metadata_and_an_empty_assistant_field() {
+        for row in ["a\tb\tc\td\te\tf", "a\tb\tc\td\te\tf\tg\th\ti"] {
             assert!(preview(row, "query", false, false).is_err());
         }
         assert!(
