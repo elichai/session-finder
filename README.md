@@ -98,9 +98,21 @@ session-finder --vscode --print SESSION_ID
 session-finder --vscode --open SESSION_ID
 ```
 
-Use `--vscode-insiders` instead for Insiders. These modes require `code` or `code-insiders` in `PATH` and the matching extension installed. The panel shows only Claude and Codex sessions in these modes, including after refresh. Without either flag, Enter still copies terminal resume commands and Ctrl-O still opens the desktop app.
+Use `--vscode-insiders` instead for Insiders. These modes require `code` or `code-insiders` in `PATH`, the matching provider extension, and the Session Finder helper installed in that editor profile. The panel shows only Claude and Codex sessions in these modes, including after refresh. Without either flag, Enter still copies terminal resume commands and Ctrl-O still opens the desktop app.
 
-**Focus the session's workspace in the editor first.** The links select an existing session ID but do not switch workspaces. [Claude's documented link](https://code.claude.com/docs/en/vs-code#launch-a-vs-code-tab-from-other-tools) can silently start a new conversation if that session is not available in the focused workspace. Codex uses the installed extension's `/local/<id>` route; that route is internal and can change with extension updates. The tool prints the workspace reminder when copying or opening.
+Install the helper once from the repository:
+
+```sh
+cd vscode-extension
+zip /tmp/session-finder-vscode.vsix extension.vsixmanifest '[Content_Types].xml' extension/package.json extension/extension.js extension/claude.js
+code --install-extension /tmp/session-finder-vscode.vsix
+```
+
+For Insiders, use `code-insiders --install-extension` instead. Reload the editor window after updating the helper. The helper uses an already matching single-folder window or opens a new window at the recorded directory, leaving the original workspace open. It waits for the destination extension host before requesting the existing session. Multi-root workspaces route to a single-folder window because the providers derive their working directory from the first folder.
+
+Claude sessions are checked in the provider's configured store before opening. Missing or unsupported sessions produce an error instead of an unchecked open request. Codex opens its existing-conversation custom editor directly. These provider commands are internal and can change with extension updates; Session Finder logs requests and reports errors in the editor's “Session Finder” output channel. A completed handoff means the provider UI was requested, not that its asynchronous conversation loading succeeded.
+
+Claude's check accepts ordinary saved conversations with a text prompt in the first 64 KiB. It rejects process wrappers, legacy or symlink transcript locations, relocated/superseded sessions, and sessions it cannot verify from bounded metadata. Those sessions remain searchable and can use terminal resume. Claude has no atomic verified-open API, so deletion or modification between checking and opening remains a race in the provider.
 
 Claude's hidden metadata and known generated leading editor-context block are excluded from search. Literal tag examples are preserved. Session relocation records update the reported working directory. No extension settings files are scanned: if an extension sets a custom home only in its VS Code settings, set the same home environment variable when running Session Finder, or use the explicit history-root override below. Remote extension history must be available locally through an override; this tool does not connect to remote hosts.
 
@@ -164,7 +176,7 @@ SESSION_FINDER_CACHE=/path/to/private/index.json session-finder
 
 ## Tests
 
-Run parser tests with `cargo test`, and helper tests with `node --test cursor-extension/extension.test.js`.
+Run parser tests with `cargo test`, and helper tests with `node --test cursor-extension/extension.test.js vscode-extension/*.test.js`.
 
 ## Releasing
 

@@ -146,33 +146,25 @@ fn explicit_history_roots_override_both_custom_homes() {
 }
 
 #[test]
-fn extension_print_modes_use_existing_session_links_and_warn_about_workspace() {
+fn extension_print_modes_include_workspace_in_helper_links() {
     let fixture = Fixture::new("print");
     fixture.sessions();
     for (flag, editor, scheme) in [
         ("--vscode", "code", "vscode"),
         ("--vscode-insiders", "code-insiders", "vscode-insiders"),
     ] {
-        for (id, route) in [
-            (
-                CLAUDE,
-                format!("anthropic.claude-code/open?session={CLAUDE}"),
-            ),
-            (CODEX, format!("openai.chatgpt/local/{CODEX}")),
-        ] {
+        for (id, provider) in [(CLAUDE, "claude"), (CODEX, "codex")] {
             let output = fixture.run(&[flag, "--print", id]);
+            let cwd = fixture.0.join("work").to_str().unwrap().replace('/', "%2F");
             assert_eq!(
                 stdout(&output),
-                format!("{editor} --open-url '{scheme}://{route}'\n")
+                format!("{editor} --open-url '{scheme}://session-finder.vscode-session-opener/open?provider={provider}&id={id}&cwd={cwd}'\n")
             );
-            let warning = String::from_utf8(output.stderr).unwrap().to_lowercase();
+            let warning = String::from_utf8(output.stderr).unwrap();
             assert!(
-                warning.contains("focus") && warning.contains("workspace"),
+                !warning.contains("Focus the session's workspace"),
                 "{warning}"
             );
-            if id == CLAUDE {
-                assert!(warning.contains("new chat"), "{warning}");
-            }
         }
     }
 }
@@ -208,16 +200,16 @@ fn extension_open_passes_exact_args_to_editor_and_reports_editor_failure() {
         .unwrap();
         fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    for (flag, scheme, id, route, status) in [
-        ("--vscode", "vscode", CODEX, "openai.chatgpt/local/", "0"),
+    for (flag, scheme, id, provider, status) in [
+        ("--vscode", "vscode", CODEX, "codex", "0"),
         (
             "--vscode-insiders",
             "vscode-insiders",
             CLAUDE,
-            "anthropic.claude-code/open?session=",
+            "claude",
             "0",
         ),
-        ("--vscode", "vscode", CODEX, "openai.chatgpt/local/", "9"),
+        ("--vscode", "vscode", CODEX, "codex", "9"),
     ] {
         let output = fixture
             .command()
@@ -229,7 +221,7 @@ fn extension_open_passes_exact_args_to_editor_and_reports_editor_failure() {
             .unwrap();
         assert_eq!(
             fs::read_to_string(&capture).unwrap(),
-            format!("--open-url\n{scheme}://{route}{id}\n")
+            format!("--open-url\n{scheme}://session-finder.vscode-session-opener/open?provider={provider}&id={id}&cwd={}\n", fixture.0.join("work").to_str().unwrap().replace('/', "%2F"))
         );
         assert_eq!(
             output.status.success(),
@@ -238,7 +230,10 @@ fn extension_open_passes_exact_args_to_editor_and_reports_editor_failure() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.to_lowercase().contains("workspace"), "{stderr}");
+        assert!(
+            !stderr.contains("Focus the session's workspace"),
+            "{stderr}"
+        );
         if status != "0" {
             assert!(stderr.contains('9'), "{stderr}");
         }

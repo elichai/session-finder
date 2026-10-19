@@ -125,7 +125,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Assistant answers are always indexed in the private plaintext cache.\n",
             "Cursor opening requires the local Session Finder helper extension.\n\n",
             "--vscode or --vscode-insiders copies/opens Claude and Codex extension session links.\n",
-            "Focus the session's workspace first; Claude can start a new chat in the wrong workspace.\n",
+            "Requires the Session Finder VS Code helper to open the recorded workspace and session.\n",
             "These extensions share CLI history; no duplicate sessions are added.\n\n",
             "SESSION_FINDER_CACHE sets the private cache file path.\n",
             "SESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\n",
@@ -192,7 +192,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return open_gui(session, args.vscode);
         }
         let command = selected_resume_command(session, args.vscode)?;
-        warn_for_selection(session, args.vscode);
+        warn_if_missing(session);
         println!("{command}");
         return Ok(());
     }
@@ -215,7 +215,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return open_gui(session, args.vscode);
     }
     let command = selected_resume_command(session, args.vscode)?;
-    warn_for_selection(session, args.vscode);
+    warn_if_missing(session);
     let copied = match Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
         Ok(mut child) => {
             let written = child
@@ -525,21 +525,32 @@ fn write_cache(path: &Path, cache: &Cache) -> io::Result<()> {
 }
 
 fn vscode_url(session: &Session, editor: vscode::Editor) -> Result<String, &'static str> {
-    let route = match session.source {
-        Source::Claude => "anthropic.claude-code/open?session=",
-        Source::Codex => "openai.chatgpt/local/",
+    let provider = match session.source {
+        Source::Claude => "claude",
+        Source::Codex => "codex",
         _ => return Err("VS Code extension opening supports Claude and Codex sessions only"),
     };
     if !codex::is_uuid(&session.id) {
         return Err("session has an invalid ID");
+    }
+    let cwd = session
+        .cwd
+        .to_str()
+        .ok_or("VS Code opening requires a UTF-8 directory")?;
+    if !session.cwd.is_absolute() || cwd.chars().any(char::is_control) {
+        return Err("VS Code opening requires an absolute directory without control characters");
     }
     let mut url = match editor {
         vscode::Editor::Code => "vscode://",
         vscode::Editor::Insiders => "vscode-insiders://",
     }
     .to_owned();
-    url.push_str(route);
+    url.push_str("session-finder.vscode-session-opener/open?provider=");
+    url.push_str(provider);
+    url.push_str("&id=");
     url.push_str(&session.id);
+    url.push_str("&cwd=");
+    push_url_encoded(&mut url, cwd.as_bytes());
     Ok(url)
 }
 
@@ -555,19 +566,6 @@ fn selected_resume_command(
     command.push_str(" --open-url ");
     command.push_str(&shell_quote(&url));
     Ok(command)
-}
-
-fn warn_for_selection(session: &Session, editor: Option<vscode::Editor>) {
-    warn_if_missing(session);
-    if editor.is_some() {
-        eprintln!(
-            "Focus the session's workspace in VS Code first: {}",
-            session.cwd.display()
-        );
-        if session.source == Source::Claude {
-            eprintln!("Claude may start a new chat if this session is unavailable in the focused workspace.");
-        }
-    }
 }
 
 fn gui_command(session: &Session, editor: Option<vscode::Editor>) -> Result<Command, &'static str> {
@@ -622,7 +620,7 @@ fn open_gui(
         return Ok(());
     }
     let mut command = gui_command(session, editor)?;
-    warn_for_selection(session, editor);
+    warn_if_missing(session);
     if editor.is_none() && session.source == Source::Claude && !io::stdout().is_terminal() {
         // Claude's desktop handoff rejects redirected output, including CLI wrappers.
         let terminal = OpenOptions::new()
@@ -950,6 +948,15 @@ mod tests {
         session.source = Source::Claude;
         assert!(gui_command(&session, Some(vscode::Editor::Code)).is_err());
         assert!(selected_resume_command(&session, Some(vscode::Editor::Insiders)).is_err());
+        session.id = "019c675d-0e41-7f71-925f-1ccc0da0f692".into();
+        assert_eq!(vscode_url(&session, vscode::Editor::Insiders).unwrap(), "vscode-insiders://session-finder.vscode-session-opener/open?provider=claude&id=019c675d-0e41-7f71-925f-1ccc0da0f692&cwd=%2Ftmp%2F%C3%A9%3F%26%23");
+        for cwd in ["relative", "/tmp/line\nbreak", "/tmp/\u{85}"] {
+            session.cwd = cwd.into();
+            assert!(vscode_url(&session, vscode::Editor::Code).is_err());
+        }
+        use std::os::unix::ffi::OsStringExt;
+        session.cwd = std::ffi::OsString::from_vec(b"/tmp/\xff".to_vec()).into();
+        assert!(vscode_url(&session, vscode::Editor::Code).is_err());
     }
 
     #[test]
