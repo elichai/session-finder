@@ -86,6 +86,26 @@ Exact opening requires a native saved session and recorded local workspace metad
 
 The preview shows the editor, workspace target, title, and chat participants; these details are searchable with assistant search off. An explicit `--open 'VSCode:ID'` also disambiguates IDs shared with other providers.
 
+### Claude Code and Codex in VS Code
+
+The standalone Claude Code and Codex extensions share their CLI's history. Their conversations appear as `Claude` and `Codex`, once per session, including conversations continued in both the terminal and the editor. They do not use the native `VSCode` chat reader described above.
+
+To copy an extension session link or open it in VS Code:
+
+```sh
+session-finder --vscode                     # Enter copies the link command; Ctrl-O opens it
+session-finder --vscode --print SESSION_ID
+session-finder --vscode --open SESSION_ID
+```
+
+Use `--vscode-insiders` instead for Insiders. These modes require `code` or `code-insiders` in `PATH` and the matching extension installed. The panel shows only Claude and Codex sessions in these modes, including after refresh. Without either flag, Enter still copies terminal resume commands and Ctrl-O still opens the desktop app.
+
+**Focus the session's workspace in the editor first.** The links select an existing session ID but do not switch workspaces. [Claude's documented link](https://code.claude.com/docs/en/vs-code#launch-a-vs-code-tab-from-other-tools) can silently start a new conversation if that session is not available in the focused workspace. Codex uses the installed extension's `/local/<id>` route; that route is internal and can change with extension updates. The tool prints the workspace reminder when copying or opening.
+
+Claude's hidden metadata and known generated leading editor-context block are excluded from search. Literal tag examples are preserved. Session relocation records update the reported working directory. No extension settings files are scanned: if an extension sets a custom home only in its VS Code settings, set the same home environment variable when running Session Finder, or use the explicit history-root override below. Remote extension history must be available locally through an override; this tool does not connect to remote hosts.
+
+### Cursor
+
 For Cursor, both Enter's copied command and Ctrl-O use the desktop app, through the small local Session Finder helper extension. They target the existing chat ID; they do not start a CLI conversation. Install the helper once from the repository:
 
 ```sh
@@ -110,7 +130,7 @@ session-finder --fuzzy             # looser matching
 
 The Claude/Codex/Copilot/VS Code index is saved at **`~/.cache/session-finder/index.json`** on both macOS and Linux. It stores each source file's size and modification time, plus the session ID, working directory, activity time, preview, user messages, and assistant answers. It is a local JSON cache, not a background service.
 
-The first run reads Claude history from `~/.claude/projects`, Codex history from `~/.codex/sessions`, and archived Codex history from `~/.codex/archived_sessions`. Internal Codex review and subagent runs are excluded. Each later launch reuses unchanged entries, reparses new or changed files, and drops deleted files automatically. **No manual rebuild is needed for normal use.** `--rebuild` forces a full reparse; a missing, invalid, or incompatible cache is rebuilt automatically.
+The first run reads Claude history from `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`), Codex history from `$CODEX_HOME/sessions` (default `~/.codex/sessions`), and archived Codex history from `$CODEX_HOME/archived_sessions`. Internal Claude sidechains and Codex review/subagent runs are excluded. Each later launch reuses unchanged entries, reparses new or changed files, and drops deleted files automatically. **No manual rebuild is needed for normal use.** `--rebuild` forces a full reparse; a missing, invalid, or incompatible cache is rebuilt automatically.
 
 Copilot CLI history is read from `~/.copilot/session-state/<id>/events.jsonl`, or `$COPILOT_HOME/session-state` when configured. The reader indexes user messages and assistant answers, uses the latest recorded working directory and event timestamp, and excludes subagent messages, tool output, and reasoning. Custom session IDs are supported. Sessions without a recorded absolute directory or a user message are skipped. The older `history-session-state` format is not supported.
 
@@ -136,7 +156,7 @@ To change the cache location:
 SESSION_FINDER_CACHE=/path/to/private/index.json session-finder
 ```
 
-`SESSION_FINDER_CLAUDE_ROOT`, `SESSION_FINDER_CODEX_ROOT`, and `SESSION_FINDER_CODEX_ARCHIVE_ROOT` override history locations. `SESSION_FINDER_CURSOR_DB` overrides the Cursor database path, which defaults to `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`.
+`SESSION_FINDER_CLAUDE_ROOT`, `SESSION_FINDER_CODEX_ROOT`, and `SESSION_FINDER_CODEX_ARCHIVE_ROOT` override history locations, taking precedence over the provider home variables. Keep `CLAUDE_CONFIG_DIR` or `CODEX_HOME` set when running a copied terminal resume command for a custom home. `SESSION_FINDER_CURSOR_DB` overrides the Cursor database path, which defaults to `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`.
 
 `SESSION_FINDER_COPILOT_ROOT` overrides the Copilot `session-state` directory directly. When resuming sessions from a non-default Copilot home, keep `COPILOT_HOME` set in the terminal where you run the copied command.
 

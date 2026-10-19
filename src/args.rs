@@ -11,6 +11,7 @@ pub(crate) enum Action {
     Print(String),
     Open(String),
     PickerRows,
+    PickerExtensionRows,
     PickerHeader,
     PickerPreview {
         path: PathBuf,
@@ -24,6 +25,7 @@ pub(crate) struct Args {
     pub action: Action,
     pub rebuild: bool,
     pub fuzzy: bool,
+    pub vscode: Option<crate::vscode::Editor>,
 }
 
 impl Args {
@@ -32,11 +34,11 @@ impl Args {
         let mut parsed = Self::default();
         // Picker helpers have fixed arguments; their query may itself be a flag.
         match arguments.peek().map(String::as_str) {
-            Some("--picker-header" | "--picker-rows") => {
-                parsed.action = if arguments.next().as_deref() == Some("--picker-header") {
-                    Action::PickerHeader
-                } else {
-                    Action::PickerRows
+            Some("--picker-header" | "--picker-rows" | "--picker-extension-rows") => {
+                parsed.action = match arguments.next().as_deref() {
+                    Some("--picker-header") => Action::PickerHeader,
+                    Some("--picker-extension-rows") => Action::PickerExtensionRows,
+                    _ => Action::PickerRows,
                 };
                 return if arguments.next().is_none() {
                     Ok(parsed)
@@ -66,11 +68,21 @@ impl Args {
         let mut actions = 0;
         let mut unknown = false;
         let mut missing_id = false;
+        let mut conflicting_editors = false;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "-h" | "--help" => help = true,
                 "--rebuild" => parsed.rebuild = true,
                 "--fuzzy" => parsed.fuzzy = true,
+                "--vscode" | "--vscode-insiders" => {
+                    let editor = if argument == "--vscode" {
+                        crate::vscode::Editor::Code
+                    } else {
+                        crate::vscode::Editor::Insiders
+                    };
+                    conflicting_editors |= parsed.vscode.is_some_and(|previous| previous != editor);
+                    parsed.vscode = Some(editor);
+                }
                 "--list" => {
                     actions += 1;
                     parsed.action = Action::List;
@@ -92,6 +104,8 @@ impl Args {
         }
         if help {
             parsed.action = Action::Help;
+        } else if conflicting_editors {
+            return Err("choose one of --vscode or --vscode-insiders");
         } else if actions > 1 {
             return Err("choose one of --list, --print, or --open");
         } else if unknown {
@@ -108,6 +122,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vscode_modes_work_with_print_and_reject_conflicting_editors() {
+        for mode in ["--vscode", "--vscode-insiders"] {
+            assert!(Args::parse([mode, "--print", "session-id"].map(str::to_owned)).is_ok());
+        }
+        assert!(Args::parse(["--vscode", "--vscode-insiders"].map(str::to_owned)).is_err());
+    }
+
+    #[test]
     fn parses_actions_and_flags_in_either_order() {
         for arguments in [
             ["--rebuild", "--print", "session-id", "--fuzzy"],
@@ -119,6 +141,7 @@ mod tests {
                     action: Action::Print("session-id".into()),
                     rebuild: true,
                     fuzzy: true,
+                    vscode: None,
                 }
             );
         }
