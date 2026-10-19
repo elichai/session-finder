@@ -80,6 +80,7 @@ jobs:
           SESSION_FINDER_CLAUDE_ROOT: /nonexistent/claude
           SESSION_FINDER_CODEX_ROOT: /nonexistent/codex
           SESSION_FINDER_CODEX_ARCHIVE_ROOT: /nonexistent/archived
+          SESSION_FINDER_COPILOT_ROOT: /nonexistent/copilot
           SESSION_FINDER_CURSOR_DB: /nonexistent/cursor.db
         run: |
           export SESSION_FINDER_CACHE="$RUNNER_TEMP/session-finder/index.json"

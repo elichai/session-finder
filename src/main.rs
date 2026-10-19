@@ -1,6 +1,7 @@
 mod args;
 mod claude;
 mod codex;
+mod copilot;
 mod cursor;
 mod json_lines;
 mod picker;
@@ -24,6 +25,7 @@ const CACHE_VERSION: u8 = 5;
 pub enum Source {
     Claude,
     Codex,
+    Copilot,
     Cursor,
 }
 
@@ -68,6 +70,7 @@ struct History {
     claude_root: PathBuf,
     codex_root: PathBuf,
     codex_archive_root: PathBuf,
+    copilot_root: PathBuf,
     cursor_db: PathBuf,
     cache_path: PathBuf,
 }
@@ -98,7 +101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => (),
     }
     if args.action == Action::Help {
-        println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\nSearch local Claude, Codex, and Cursor sessions, most recent first.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nBoth modes use literal characters and smart case, without extended-search operators.\nEnter copies the exact resume command. Ctrl-O opens the selected session in its app. Esc cancels.\nCtrl-A toggles assistant-answer search (off initially). Ctrl-R refreshes history.\nThe bottom pane shows a highlighted matching passage. Requires fzf 0.71.0 or later.\nAssistant answers are always indexed in the private plaintext cache.\nCursor opening requires the local Session Finder helper extension.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\nSESSION_FINDER_CURSOR_DB overrides Cursor's local history database.");
+        println!("Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\nSearch local Claude, Codex, Copilot CLI, and Cursor sessions, most recent first.\nSearch matches the typed phrase; --fuzzy enables loose subsequence matching.\nBoth modes use literal characters and smart case, without extended-search operators.\nEnter copies the exact resume command. Ctrl-O opens the selected session in its app. Esc cancels.\nCopilot CLI sessions resume in a terminal; use Enter or --print, not Ctrl-O or --open.\nCtrl-A toggles assistant-answer search (off initially). Ctrl-R refreshes history.\nThe bottom pane shows a highlighted matching passage. Requires fzf 0.71.0 or later.\nAssistant answers are always indexed in the private plaintext cache.\nCursor opening requires the local Session Finder helper extension.\n\nSESSION_FINDER_CACHE sets the private cache file path.\nSESSION_FINDER_CLAUDE_ROOT, SESSION_FINDER_CODEX_ROOT, and\nSESSION_FINDER_CODEX_ARCHIVE_ROOT override history roots.\nSESSION_FINDER_COPILOT_ROOT overrides Copilot's session-state directory.\nOtherwise Copilot uses $COPILOT_HOME/session-state or ~/.copilot/session-state.\nSESSION_FINDER_CURSOR_DB overrides Cursor's local history database.");
         return Ok(());
     }
 
@@ -138,7 +141,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if sessions.is_empty() {
-        return Err("no Claude, Codex, or Cursor sessions found".into());
+        return Err("no Claude, Codex, Copilot CLI, or Cursor sessions found".into());
     }
     let Some((selected, action)) = picker::choose(&sessions, args.fuzzy)? else {
         return Ok(());
@@ -189,6 +192,9 @@ impl History {
                 "SESSION_FINDER_CODEX_ARCHIVE_ROOT",
                 ".codex/archived_sessions",
             ),
+            copilot_root: std::env::var_os("SESSION_FINDER_COPILOT_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path("COPILOT_HOME", ".copilot").join("session-state")),
             cursor_db: path(
                 "SESSION_FINDER_CURSOR_DB",
                 "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
@@ -229,6 +235,12 @@ impl History {
                 codex::session_files,
                 codex::parse_file,
                 true,
+            ),
+            (
+                &self.copilot_root,
+                copilot::session_files,
+                copilot::parse_file,
+                false,
             ),
         ] {
             for path in files(root) {
@@ -398,12 +410,16 @@ fn write_cache(path: &Path, cache: &Cache) -> io::Result<()> {
 }
 
 fn gui_command(session: &Session) -> Result<Command, &'static str> {
+    if session.source == Source::Copilot {
+        return Err("Copilot CLI has no supported desktop session link; use Enter or --print to copy its resume command");
+    }
     if !codex::is_uuid(&session.id) {
         return Err("session has an invalid ID");
     }
     let mut command = match session.source {
         Source::Claude => Command::new("claude"),
         Source::Codex | Source::Cursor => Command::new("open"),
+        Source::Copilot => unreachable!(),
     };
     match session.source {
         Source::Claude => {
@@ -417,6 +433,7 @@ fn gui_command(session: &Session) -> Result<Command, &'static str> {
         Source::Cursor => {
             command.arg(cursor_url(session));
         }
+        Source::Copilot => unreachable!(),
     }
     Ok(command)
 }
@@ -471,6 +488,7 @@ fn source_name(source: Source) -> &'static str {
     match source {
         Source::Claude => "Claude",
         Source::Codex => "Codex",
+        Source::Copilot => "Copilot",
         Source::Cursor => "Cursor",
     }
 }
@@ -480,6 +498,7 @@ fn display_source(session: &Session) -> &'static str {
         (Source::Claude, true) => "Claude*",
         (Source::Codex, true) => "Codex*",
         (Source::Cursor, true) => "Cursor*",
+        (Source::Copilot, true) => "Copilot*",
         (source, false) => source_name(source),
     }
 }
@@ -540,6 +559,7 @@ fn resume_command(session: &Session) -> String {
     match session.source {
         Source::Claude => format!("cd -- {cwd} && claude --resume {id}"),
         Source::Codex => format!("codex resume {id} -C {cwd}"),
+        Source::Copilot => ["cd -- ", &cwd, " && copilot --resume=", &id].concat(),
         Source::Cursor => ["open ", &shell_quote(&cursor_url(session))].concat(),
     }
 }

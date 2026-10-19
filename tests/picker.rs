@@ -61,6 +61,7 @@ fn refresh_rows_discover_changed_new_and_deleted_sessions() {
             .env("SESSION_FINDER_CLAUDE_ROOT", &root)
             .env("SESSION_FINDER_CODEX_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CODEX_ARCHIVE_ROOT", root.join("missing"))
+            .env("SESSION_FINDER_COPILOT_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CURSOR_DB", root.join("missing.db"))
             .env("SESSION_FINDER_CACHE", root.join("index.json"))
             .output()
