@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
+  <Metadata>
+    <Identity Id="vscode-session-opener" Version="0.1.0" Language="en-US" Publisher="session-finder" />
+    <DisplayName>Session Finder</DisplayName>
+    <Description xml:space="preserve">Open existing Claude Code and Codex chats in their recorded local workspace.</Description>
+    <Categories>Other</Categories>
+    <Properties>
+      <Property Id="Microsoft.VisualStudio.Code.Engine" Value="^1.85.0" />
+      <Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="ui" />
+    </Properties>
+  </Metadata>
+  <Installation><InstallationTarget Id="Microsoft.VisualStudio.Code" /></Installation>
+  <Dependencies />
+  <Assets><Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true" /></Assets>
+</PackageManifest>

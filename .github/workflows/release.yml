@@ -60,7 +60,7 @@ jobs:
         run: |
           cargo test --locked --release --target "$TARGET"
           cargo build --locked --release --target "$TARGET"
-          node --test cursor-extension/extension.test.js
+          node --test cursor-extension/extension.test.js vscode-extension/*.test.js
       - name: Check runtime dependencies
         run: |
           binary="target/$TARGET/release/session-finder"
