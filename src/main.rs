@@ -10,6 +10,7 @@ mod timestamp;
 mod vscode;
 mod vscode_native;
 mod vscode_open;
+mod vscode_remote;
 
 use args::{Action, Args};
 use serde::{Deserialize, Serialize};
