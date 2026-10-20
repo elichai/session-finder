@@ -3,7 +3,7 @@
 //! Server storage has no `workspace.json`; its directory name is
 //! `md5("vscode-remote://ssh-remote%2B<host><folder>")`. Copilot's debug log records the
 //! workspace folder, so a candidate is trusted only when it reproduces that hash.
-use crate::{codex::is_uuid, push_url_encoded, vscode, vscode_open, Session};
+use crate::{codex::is_uuid, push_url_encoded, vscode, vscode_open, BorrowedStr, Session};
 use std::{
     collections::HashSet,
     fs,
@@ -76,7 +76,13 @@ pub fn url(session: &Session) -> Option<String> {
         vscode::Editor::Code => "vscode",
         vscode::Editor::Insiders => "vscode-insiders",
     };
-    let mut url = [scheme, "://vscode-remote/ssh-remote+", &target, "?session="].concat();
+    let mut url = [
+        scheme,
+        "://vscode-remote/ssh-remote+",
+        &target,
+        "?windowId=_blank&session=",
+    ]
+    .concat();
     push_url_encoded(&mut url, vscode_open::chat_resource(&session.id).as_bytes());
     Some(url)
 }
@@ -108,37 +114,66 @@ fn read_prefix(path: &Path) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+// Decode quoted strings, including JSON arguments embedded inside other string values.
+fn strings(text: &str, visit: &mut impl FnMut(&str)) {
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some(index) = rest.find('"') {
+            let input = &rest[index..];
+            let mut values =
+                serde_json::Deserializer::from_str(input).into_iter::<BorrowedStr<'_>>();
+            // The bounded prefix can end inside a large string; do not rescan its escapes.
+            let Some(Ok(value)) = values.next() else {
+                break;
+            };
+            visit(&value);
+            strings(&value, visit);
+            rest = &input[values.byte_offset()..];
+        }
+    }
+}
+
 /// First folder of each "workspace with the following folders" prompt near the log start.
 fn logged_folders(path: &Path) -> Vec<String> {
     let text = read_prefix(path);
     let mut folders: Vec<String> = Vec::new();
-    for (index, _) in text.match_indices(MARKER) {
-        // The prompt is JSON-escaped once or twice, so its newline is `\n` or `\\n`.
-        let rest = text[index + MARKER.len()..].trim_start_matches('\\');
-        let Some(rest) = rest.strip_prefix("n- ") else {
-            continue;
-        };
-        let folder = rest.split('\\').next().unwrap_or_default().trim();
-        if folder.starts_with('/') && !folder.contains('"') && !folders.iter().any(|f| f == folder)
-        {
-            folders.push(folder.to_owned());
+    strings(&text, &mut |value| {
+        for (index, _) in value.match_indices(MARKER) {
+            let rest = &value[index + MARKER.len()..];
+            let decoded;
+            let rest = if rest.starts_with("\\n- ") {
+                let quoted = ["\"", rest, "\""].concat();
+                let Ok(value) = serde_json::from_str::<String>(&quoted) else {
+                    continue;
+                };
+                decoded = value;
+                decoded.as_str()
+            } else {
+                rest
+            };
+            let Some(rest) = rest.strip_prefix("\n- ") else {
+                continue;
+            };
+            let folder = rest.lines().next().unwrap_or_default().trim();
+            if folder.starts_with('/') && !folders.iter().any(|f| f == folder) {
+                folders.push(folder.to_owned());
+            }
         }
-    }
+    });
     folders
 }
 
-/// Ancestors of quoted absolute paths in a transcript, deepest first.
+/// Quoted absolute paths and their ancestors, deepest first.
 fn mentioned_folders(path: &Path) -> Vec<String> {
     let text = read_prefix(path);
     let mut folders = Vec::new();
     let mut seen = HashSet::new();
-    for (index, _) in text.match_indices("\"/") {
-        let rest = &text[index + 1..];
-        let end = rest
-            .find(|c: char| c == '"' || c == '\\' || c == ':' || c.is_whitespace())
-            .unwrap_or(rest.len());
-        for ancestor in Path::new(&rest[..end]).ancestors().skip(1) {
-            let Some(folder) = ancestor.to_str().filter(|f| f.len() > 1) else {
+    strings(&text, &mut |value| {
+        if !value.starts_with('/') {
+            return;
+        }
+        for ancestor in Path::new(value).ancestors() {
+            let Some(folder) = ancestor.to_str() else {
                 break;
             };
             if !seen.insert(folder.to_owned()) {
@@ -146,7 +181,7 @@ fn mentioned_folders(path: &Path) -> Vec<String> {
             }
             folders.push(folder.to_owned());
         }
-    }
+    });
     folders
 }
 
@@ -162,7 +197,9 @@ fn encode_path(folder: &str) -> Option<String> {
         return None;
     }
     let mut encoded = String::with_capacity(folder.len());
-    for (index, component) in folder.trim_end_matches('/').split('/').enumerate() {
+    let trimmed = folder.trim_end_matches('/');
+    let folder = if trimmed.is_empty() { "/" } else { trimmed };
+    for (index, component) in folder.split('/').enumerate() {
         if index > 0 {
             encoded.push('/');
         }
@@ -186,7 +223,7 @@ fn md5(input: &[u8]) -> [u8; 16] {
     }
     message.extend_from_slice(&(input.len() as u64).wrapping_mul(8).to_le_bytes());
     let mut state: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let words: [u32; 16] = std::array::from_fn(|i| {
             u32::from_le_bytes([
                 chunk[i * 4],
@@ -217,7 +254,7 @@ fn md5(input: &[u8]) -> [u8; 16] {
         }
     }
     let mut digest = [0; 16];
-    for (bytes, value) in digest.chunks_exact_mut(4).zip(state) {
+    for (bytes, value) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
         bytes.copy_from_slice(&value.to_le_bytes());
     }
     digest
@@ -275,7 +312,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             mentioned_folders(&transcript),
-            ["/work/app/src", "/work/app", "/work"]
+            [
+                "/work/app/src/a.rs",
+                "/work/app/src",
+                "/work/app",
+                "/work",
+                "/",
+                "/work/app/src/b.rs:12",
+            ]
         );
         fs::remove_dir_all(dir).unwrap();
     }
