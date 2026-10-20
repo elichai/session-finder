@@ -1,5 +1,5 @@
 use crate::{codex::is_uuid, copilot, session_files::SessionFiles, Session, Source};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsString,
     fs,
@@ -19,28 +19,69 @@ pub const DEFAULT_ROOTS: [&str; 6] = [
     ".vscode-server-insiders/data/User/workspaceStorage",
 ];
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Editor {
+    #[default]
+    Code,
+    Insiders,
+}
+
+impl Editor {
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Insiders => "code-insiders",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Context {
+    pub editor: Editor,
+    pub target: Option<PathBuf>,
+    pub title: String,
+    pub participants: Vec<String>,
+    pub format: StorageFormat,
+    #[serde(skip)]
+    pub storage: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum StorageFormat {
+    #[default]
+    Transcript,
+    Snapshot,
+    Journal,
+}
+
 #[derive(Deserialize)]
 struct Workspace {
     folder: Option<String>,
     workspace: Option<String>,
 }
 
-/// Lists `<root>/<workspace>/GitHub.copilot-chat/transcripts/<uuid>.jsonl` without
-/// walking the rest of workspaceStorage, which can hold gigabytes of unrelated data.
+/// Scan saved chat sessions and supplemental Copilot hook transcripts only.
 pub fn session_files(root: &Path) -> SessionFiles {
-    let transcripts = fs::read_dir(root)
+    let directories = fs::read_dir(root)
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path().join("GitHub.copilot-chat/transcripts"));
-    SessionFiles::from_dirs(transcripts, |path| {
+        .flat_map(|entry| {
+            [
+                entry.path().join("chatSessions"),
+                entry.path().join("GitHub.copilot-chat/transcripts"),
+            ]
+        });
+    let empty_windows = root
+        .parent()
+        .map(|user| user.join("globalStorage/emptyWindowChatSessions"));
+    SessionFiles::from_dirs(directories.chain(empty_windows), |path| {
         path.extension()
-            .is_some_and(|extension| extension == "jsonl")
-            && path
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|name| name == "transcripts")
+            .is_some_and(|extension| extension == "jsonl" || extension == "json")
+            && path.parent().and_then(Path::file_name).is_some_and(|name| {
+                name == "transcripts" || name == "chatSessions" || name == "emptyWindowChatSessions"
+            })
             && session_id(path).is_some()
     })
 }
@@ -52,6 +93,13 @@ fn session_id(path: &Path) -> Option<&str> {
 }
 
 pub fn parse_file(path: &Path) -> io::Result<Option<Session>> {
+    if path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "chatSessions" || name == "emptyWindowChatSessions")
+    {
+        return crate::vscode_native::parse_file(path);
+    }
     let Some(id) = session_id(path) else {
         return Ok(None);
     };
@@ -60,37 +108,90 @@ pub fn parse_file(path: &Path) -> io::Result<Option<Session>> {
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_secs() as i64;
-    let session = copilot::parse_events(
+    copilot::parse_events(
         Source::VsCode,
         id,
         BufReader::new(fs::File::open(path)?),
         modified,
-    )?;
-    Ok(session.map(|mut session| {
-        // Remote (SSH/WSL/container) workspaces have no workspace.json on the server.
-        if session.cwd.as_os_str().is_empty() {
-            session.cwd = path
-                .ancestors()
-                .nth(3)
-                .and_then(workspace_folder)
-                .unwrap_or_default();
-        }
-        session
-    }))
+    )
 }
 
-fn workspace_folder(storage: &Path) -> Option<PathBuf> {
-    let text = fs::read(storage.join("workspace.json")).ok()?;
-    let workspace: Workspace = serde_json::from_slice(&text).ok()?;
-    if let Some(folder) = workspace.folder {
-        return file_uri_path(&folder);
-    }
-    file_uri_path(&workspace.workspace?)?
+/// Resolve the sidecar after loading cached text so sidecar changes take effect immediately.
+pub fn resolve_context(path: &Path, session: &mut Session) {
+    let storage = if path
         .parent()
-        .map(Path::to_path_buf)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "chatSessions")
+    {
+        path.ancestors().nth(2)
+    } else if path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "transcripts")
+    {
+        path.ancestors().nth(3)
+    } else {
+        None
+    };
+    let context = session.vscode.get_or_insert_with(Context::default);
+    context.editor = if path.components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some("Code - Insiders" | ".vscode-server-insiders")
+        )
+    }) {
+        Editor::Insiders
+    } else {
+        Editor::Code
+    };
+    let workspace = storage
+        .and_then(|storage| fs::read(storage.join("workspace.json")).ok())
+        .and_then(|text| serde_json::from_slice::<Workspace>(&text).ok());
+    let folder = workspace
+        .as_ref()
+        .and_then(|workspace| workspace.folder.as_deref())
+        .and_then(file_uri_path);
+    context.target = workspace
+        .as_ref()
+        .and_then(|workspace| workspace.workspace.as_deref())
+        .and_then(file_uri_path)
+        .or_else(|| folder.clone());
+    // A working-directory fallback does not identify the store owning a native chat.
+    context.storage = storage
+        .filter(|_| context.target.is_some())
+        .map(Path::to_path_buf);
+    if session.cwd.as_os_str().is_empty() {
+        session.cwd = folder.unwrap_or_default();
+    }
+    if context.target.is_none() && !session.cwd.as_os_str().is_empty() {
+        context.target = Some(session.cwd.clone());
+    }
 }
 
-fn file_uri_path(uri: &str) -> Option<PathBuf> {
+pub fn details(session: &Session) -> String {
+    let Some(context) = session.vscode.as_ref() else {
+        return String::new();
+    };
+    let mut details = match context.editor {
+        Editor::Code => String::from("VS Code"),
+        Editor::Insiders => String::from("VS Code Insiders"),
+    };
+    if let Some(target) = &context.target {
+        details.push_str(" • Workspace: ");
+        details.push_str(&target.to_string_lossy());
+    }
+    if !context.title.is_empty() {
+        details.push_str(" • Title: ");
+        details.push_str(&context.title);
+    }
+    if !context.participants.is_empty() {
+        details.push_str(" • Participants: ");
+        details.push_str(&context.participants.join(", "));
+    }
+    details
+}
+
+pub(crate) fn file_uri_path(uri: &str) -> Option<PathBuf> {
     let encoded = uri.strip_prefix("file://")?.as_bytes();
     if encoded.first() != Some(&b'/') {
         return None;
@@ -132,26 +233,5 @@ mod tests {
         ] {
             assert!(file_uri_path(uri).is_none(), "{uri}");
         }
-    }
-
-    #[test]
-    fn reads_folder_or_multi_root_workspace_location() {
-        let root = std::env::temp_dir().join(format!("session-vscode-ws-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("workspace.json"),
-            r#"{"folder":"file:///work/app"}"#,
-        )
-        .unwrap();
-        assert_eq!(workspace_folder(&root).unwrap(), Path::new("/work/app"));
-        fs::write(
-            root.join("workspace.json"),
-            r#"{"workspace":"file:///work/all.code-workspace"}"#,
-        )
-        .unwrap();
-        assert_eq!(workspace_folder(&root).unwrap(), Path::new("/work"));
-        fs::remove_file(root.join("workspace.json")).unwrap();
-        assert!(workspace_folder(&root).is_none());
-        fs::remove_dir_all(root).unwrap();
     }
 }

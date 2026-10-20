@@ -147,6 +147,7 @@ fn parse_reader(path: &Path, reader: impl BufRead) -> io::Result<Option<Session>
         assistant_text,
         preview,
         archived: false,
+        vscode: None,
     }))
 }
 

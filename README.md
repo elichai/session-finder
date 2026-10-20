@@ -1,6 +1,6 @@
 # session-finder
 
-Find a local Claude Code, Codex, GitHub Copilot CLI, VS Code Copilot Chat, or Cursor conversation by its working directory or by text you wrote in it. The panel starts with the most recently used session. Search matches the typed phrase; run `session-finder --fuzzy` for looser subsequence matching.
+Find a local Claude Code, Codex, GitHub Copilot CLI, VS Code chat, or Cursor conversation by its working directory or by text you wrote in it. VS Code support includes Copilot and other extensions that use its native Chat view. The panel starts with the most recently used session. Search matches the typed phrase; run `session-finder --fuzzy` for looser subsequence matching.
 
 `fzf` still reads `FZF_DEFAULT_OPTS` for your preferred appearance and key bindings. The tool sets its search mode explicitly. Both modes use literal characters and smart case: lowercase queries ignore case; a query containing uppercase letters is case-sensitive. Accents are distinct, and extended-search operators are disabled, including with `--fuzzy`.
 
@@ -78,7 +78,13 @@ For Claude, Ctrl-O uses `claude --desktop --resume ID` in the recorded directory
 
 For GitHub Copilot CLI, Enter copies `cd -- 'PWD' && copilot --resume='ID'`. Both the working directory and session ID are shell-quoted. Copilot sessions use terminal resume; Ctrl-O and `--open` report that desktop opening is unavailable. This reads Copilot CLI history; VS Code Copilot Chat is listed separately as `VSCode`.
 
-For VS Code Copilot Chat, Enter copies `code 'PWD'` to open the chat's workspace; reopen the chat itself from VS Code's Chat sessions view. VS Code has no command-line or URL handler for a specific chat, so Ctrl-O and `--open` report that opening is unavailable. Remote (SSH, WSL, container) workspaces do not record their folder on the server, so those chats have no PWD and Enter copies a shell comment naming the session instead.
+For saved native VS Code chats, including Copilot, **Ctrl-O opens the exact chat in its recorded workspace**. This uses VS Code's built-in session route and needs no Session Finder helper extension or extra mode flag. Stable sessions use `code`; Insiders sessions use `code-insiders`. The opening command selects the source user-data directory, including a custom directory with the standard `User/workspaceStorage` layout, so it reads the correct saved chat. Multi-root workspaces keep their exact `.code-workspace` target.
+
+Enter copies a `session-finder --open 'VSCode:ID'` command using this binary's path. Session Finder coordinates editor startup before opening the chat, because Code's initial URL handling can discard a session parameter. If Code is closed, the tool starts the recorded workspace, waits for the runtime URL handler, then restores the chat. When Code is already running, it opens a new target window and leaves the current workspace open. VS Code may show its standard local-file protocol confirmation; Session Finder does not change that security setting.
+
+Exact opening requires a native saved session and recorded local workspace metadata. Hook-only recovery transcripts, empty-window chats, unknown workspaces, remote-server history, and nonstandard storage layouts remain searchable. Enter retains a workspace-opening command where possible; Ctrl-O reports that exact restoration is unavailable. If no local target is known, Enter prints a shell comment naming the session. Deleted saves are checked before opening; a concurrent file change can still affect Code's own asynchronous restore.
+
+The preview shows the editor, workspace target, title, and chat participants; these details are searchable with assistant search off. An explicit `--open 'VSCode:ID'` also disambiguates IDs shared with other providers.
 
 For Cursor, both Enter's copied command and Ctrl-O use the desktop app, through the small local Session Finder helper extension. They target the existing chat ID; they do not start a CLI conversation. Install the helper once from the repository:
 
@@ -108,13 +114,19 @@ The first run reads Claude history from `~/.claude/projects`, Codex history from
 
 Copilot CLI history is read from `~/.copilot/session-state/<id>/events.jsonl`, or `$COPILOT_HOME/session-state` when configured. The reader indexes user messages and assistant answers, uses the latest recorded working directory and event timestamp, and excludes subagent messages, tool output, and reasoning. Custom session IDs are supported. Sessions without a recorded absolute directory or a user message are skipped. The older `history-session-state` format is not supported.
 
-VS Code Copilot Chat history is read from `<workspaceStorage>/<hash>/GitHub.copilot-chat/transcripts/<id>.jsonl`, which uses the same event format as Copilot CLI. By default it scans the `workspaceStorage` directories of VS Code and VS Code Insiders on Linux (`~/.config/Code*/User`) and macOS (`~/Library/Application Support/Code*/User`), and of the Remote server (`~/.vscode-server*/data/User`). The working directory comes from the sibling `workspace.json` when present. Only the transcript directories are read, not the rest of `workspaceStorage`.
+VS Code history is read from `<workspaceStorage>/<hash>/chatSessions/<id>.json` and `.jsonl`. The reader supports legacy snapshots and current snapshot/update journals, including nested sets, array updates, and deletions. It extracts human prompts and assistant text across native Chat participants, including Copilot; tool output, reasoning, hidden turns, and unsent drafts are excluded. Extensions with their own chat storage need a separate reader.
+
+By default it scans VS Code and Insiders on Linux (`~/.config/Code*/User`) and macOS (`~/Library/Application Support/Code*/User`), plus Remote servers (`~/.vscode-server*/data/User`). Chats from empty windows are read from the sibling `globalStorage/emptyWindowChatSessions` directory. Only known chat directories are scanned. The scanner holds one directory handle even with many workspaces.
+
+Copilot hook transcripts under `GitHub.copilot-chat/transcripts/<id>.jsonl` can recover a session when no valid native saved session is available. They are supplemental: VS Code creates them only for hook-enabled requests and prunes old transcripts. Each session appears once. A valid native journal takes precedence over a legacy snapshot, which takes precedence over a hook transcript; older copies cannot restore deleted text in the selected native session. A valid empty or fully hidden native session suppresses older copies and is omitted from the results. An incomplete final journal record is ignored while a live write is in progress. A corrupt journal is skipped, allowing another valid saved copy or transcript to supply the session.
+
+The working directory comes from native session metadata or `workspace.json` when available. Workspace metadata is read again on each launch or Ctrl-R refresh, even when the conversation text comes from cache. Adding, editing, or removing `workspace.json` takes effect without `--rebuild`. The first launch after this update rebuilds the older cache once.
 
 If reading a Claude, Codex, Copilot, or VS Code session file fails, the load or refresh stops with an error and leaves the existing cache unchanged. Files deleted during indexing are skipped.
 
 Cursor's desktop SQLite database is read on every launch, using a consistent read-only snapshot that includes committed WAL updates. Session metadata supplies the exact workspace or worktree path and latest activity time. Subagent chats and empty drafts are excluded. Missing Cursor history is fine; a database error is reported while the other providers remain searchable.
 
-Cursor sessions are not written to the JSON cache. An open panel keeps its current snapshot until Ctrl-R refreshes it. Search includes user messages, session IDs, and full working directories; Cursor chat titles are also searchable. Ctrl-A adds assistant answers to the search.
+Cursor sessions are not written to the JSON cache. An open panel keeps its current snapshot until Ctrl-R refreshes it. Search includes user messages, session IDs, and full working directories; Cursor chat titles and VS Code workspace targets, titles, and participant IDs are also searchable. Ctrl-A adds assistant answers to the search.
 
 The cache contains user and assistant text in plain text, including assistant answers when assistant search is off. New cache directories are created with mode `0700`, and the cache file with mode `0600`. Cache updates use a temporary file and rename it into place. Session Finder does not upload history or the cache. The first launch after this update rebuilds older caches automatically.
 
@@ -128,7 +140,7 @@ SESSION_FINDER_CACHE=/path/to/private/index.json session-finder
 
 `SESSION_FINDER_COPILOT_ROOT` overrides the Copilot `session-state` directory directly. When resuming sessions from a non-default Copilot home, keep `COPILOT_HOME` set in the terminal where you run the copied command.
 
-`SESSION_FINDER_VSCODE_ROOT` replaces the default VS Code `workspaceStorage` directories with a colon-separated list.
+`SESSION_FINDER_VSCODE_ROOT` replaces the default VS Code `workspaceStorage` directories with a colon-separated list, including for custom user-data locations. Each root also supplies its sibling `globalStorage/emptyWindowChatSessions` directory. The command uses `code-insiders` when the storage path contains `Code - Insiders` or `.vscode-server-insiders`.
 
 ## Tests
 

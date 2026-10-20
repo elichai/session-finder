@@ -93,6 +93,7 @@ pub(crate) fn parse_events(
         assistant_text: String::new(),
         preview: String::new(),
         archived: false,
+        vscode: None,
     };
     let mut started = false;
     let mut updated = None;
