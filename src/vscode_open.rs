@@ -1,4 +1,4 @@
-use crate::{codex::is_uuid, push_url_encoded, vscode, Session, Source};
+use crate::{codex::is_uuid, push_url_encoded, vscode, vscode_remote, Session, Source};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
@@ -99,17 +99,7 @@ impl<'a> Target<'a> {
         } else {
             "?session="
         });
-        let mut resource = String::from("vscode-chat-session://local/");
-        const BASE64: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        // UUID text is 36 ASCII bytes, so base64 has no partial block or padding.
-        for block in self.session.id.as_bytes().as_chunks::<3>().0 {
-            let value = u32::from(block[0]) << 16 | u32::from(block[1]) << 8 | u32::from(block[2]);
-            for shift in [18, 12, 6, 0] {
-                resource.push(char::from(BASE64[((value >> shift) & 63) as usize]));
-            }
-        }
-        push_url_encoded(&mut url, resource.as_bytes());
+        push_url_encoded(&mut url, chat_resource(&self.session.id).as_bytes());
         url
     }
 
@@ -160,12 +150,53 @@ impl<'a> Target<'a> {
     }
 }
 
+/// `vscode-chat-session://local/<base64url id>`; callers pass a validated UUID.
+pub(crate) fn chat_resource(id: &str) -> String {
+    let mut resource = String::from("vscode-chat-session://local/");
+    const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    // UUID text is 36 ASCII bytes, so base64 has no partial block or padding.
+    for block in id.as_bytes().as_chunks::<3>().0 {
+        let value = u32::from(block[0]) << 16 | u32::from(block[1]) << 8 | u32::from(block[2]);
+        for shift in [18, 12, 6, 0] {
+            resource.push(char::from(BASE64[((value >> shift) & 63) as usize]));
+        }
+    }
+    resource
+}
+
+/// Remote-SSH terminals set `$BROWSER` to a helper that opens URLs on the client machine.
+fn remote_command(url: &str) -> Command {
+    let mut command =
+        Command::new(std::env::var_os("BROWSER").unwrap_or_else(|| "xdg-open".into()));
+    command.arg(url);
+    command
+}
+
 pub fn command(session: &Session, new_window: bool) -> Result<Command, &'static str> {
-    Ok(Target::new(session)?.command(new_window))
+    match Target::new(session) {
+        Ok(target) => Ok(target.command(new_window)),
+        Err(error) => vscode_remote::url(session)
+            .map(|url| remote_command(&url))
+            .ok_or(error),
+    }
 }
 
 pub fn open(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
-    let target = Target::new(session)?;
+    let target = match Target::new(session) {
+        Ok(target) => target,
+        Err(error) => {
+            let url = vscode_remote::url(session).ok_or(error)?;
+            if std::env::var_os("BROWSER").is_none() {
+                println!("Open this URL on the computer running VS Code:\n{url}");
+                return Ok(());
+            }
+            run(
+                remote_command(&url),
+                Instant::now() + Duration::from_secs(30),
+            )?;
+            return Ok(());
+        }
+    };
     target.check_saved()?;
     let deadline = Instant::now() + Duration::from_secs(30);
     let running = target.ready(deadline)?;

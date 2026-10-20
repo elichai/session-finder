@@ -44,6 +44,9 @@ pub struct Context {
     pub format: StorageFormat,
     #[serde(skip)]
     pub storage: Option<PathBuf>,
+    /// Server-side storage of a Remote-SSH chat, used to recover its folder on demand.
+    #[serde(skip)]
+    pub remote_storage: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -156,6 +159,17 @@ pub fn resolve_context(path: &Path, session: &mut Session) {
         .and_then(|workspace| workspace.workspace.as_deref())
         .and_then(file_uri_path)
         .or_else(|| folder.clone());
+    // Canonicalize so a symlinked desktop path (e.g. `~/.config/Code/User`) is still recognized.
+    context.remote_storage = storage
+        .and_then(|storage| fs::canonicalize(storage).ok())
+        .filter(|storage| {
+            storage.components().any(|part| {
+                matches!(
+                    part.as_os_str().to_str(),
+                    Some(".vscode-server" | ".vscode-server-insiders")
+                )
+            })
+        });
     // A working-directory fallback does not identify the store owning a native chat.
     context.storage = storage
         .filter(|_| context.target.is_some())
