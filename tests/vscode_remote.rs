@@ -97,6 +97,7 @@ impl Fixture {
             "CODEX_ARCHIVE_ROOT",
             "COPILOT_ROOT",
             "CURSOR_DB",
+            "OPENCODE_DB",
         ] {
             command.env(format!("SESSION_FINDER_{name}"), self.root.join("missing"));
         }

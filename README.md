@@ -1,12 +1,12 @@
 # session-finder
 
-Find a local Claude Code, Codex, GitHub Copilot CLI, VS Code chat, or Cursor conversation by its working directory or by text you wrote in it. VS Code support includes Copilot and other extensions that use its native Chat view. The panel starts with the most recently used session. Search matches the typed phrase; run `session-finder --fuzzy` for looser subsequence matching.
+Find a local Claude Code, Codex, GitHub Copilot CLI, OpenCode, VS Code chat, or Cursor conversation by its working directory or by text you wrote in it. VS Code support includes Copilot and other extensions that use its native Chat view. The panel starts with the most recently used session. Search matches the typed phrase; run `session-finder --fuzzy` for looser subsequence matching.
 
 `fzf` still reads `FZF_DEFAULT_OPTS` for your preferred appearance and key bindings. The tool sets its search mode explicitly. Both modes use literal characters and smart case: lowercase queries ignore case; a query containing uppercase letters is case-sensitive. Accents are distinct, and extended-search operators are disabled, including with `--fuzzy`.
 
 ## Install
 
-Requires **fzf 0.71.0 or later**. The picker uses field-based selection tracking across refreshes, added in fzf 0.71.0. SQLite is bundled into the binary; no system SQLite installation is needed. Install the Claude, Codex, or Copilot CLI to resume that provider in a terminal.
+Requires **fzf 0.71.0 or later**. The picker uses field-based selection tracking across refreshes, added in fzf 0.71.0. SQLite is bundled into the binary; no system SQLite installation is needed. Install the Claude, Codex, Copilot, or OpenCode CLI to resume that provider in a terminal. OpenCode resume commands target its v2 CLI; reading its database does not require OpenCode to be installed.
 
 ### macOS (Homebrew)
 
@@ -26,7 +26,7 @@ fzf --version
 
 Distribution packages can be older than 0.71.0. If yours is, install a recent binary from the [official fzf releases](https://github.com/junegunn/fzf/releases) and put it ahead of the older binary in `PATH`.
 
-Linux supports the Claude/Codex/Copilot/VS Code history panel and printed terminal resume commands. Clipboard copying and Codex/Cursor GUI opening currently use macOS tools (`pbcopy` and `open`). The Cursor helper installation instructions below also target macOS. Cursor's default database path is specific to macOS; use `SESSION_FINDER_CURSOR_DB` to point at its database on Linux.
+Linux supports the Claude/Codex/Copilot/OpenCode/VS Code history panel and printed terminal resume commands. Clipboard copying and Codex/Cursor GUI opening currently use macOS tools (`pbcopy` and `open`). The Cursor helper installation instructions below also target macOS. Cursor's default database path is specific to macOS; use `SESSION_FINDER_CURSOR_DB` to point at its database on Linux.
 
 ### Prebuilt binaries
 
@@ -78,6 +78,8 @@ For Claude, Ctrl-O uses `claude --desktop --resume ID` in the recorded directory
 
 For GitHub Copilot CLI, Enter copies `cd -- 'PWD' && copilot --resume='ID'`. Both the working directory and session ID are shell-quoted. Copilot sessions use terminal resume; Ctrl-O and `--open` report that desktop opening is unavailable. This reads Copilot CLI history; VS Code Copilot Chat is listed separately as `VSCode`.
 
+For OpenCode, Enter copies `cd -- 'PWD' && OPENCODE_DB='DATABASE' opencode --standalone --session 'ses_ID'`. The command selects the scanned database and uses OpenCode v2's private server mode, so a shared background server cannot send it to a different store. Paths and IDs are shell-quoted. Ctrl-O and `--open` explain that these sessions resume in a terminal. OpenCode itself can create a session when a supplied ID no longer exists; a copied command cannot guarantee strict restoration after the saved session is deleted. See the [OpenCode CLI reference](https://opencode.ai/docs/cli).
+
 For saved native VS Code chats, including Copilot, **Ctrl-O opens the exact chat in its recorded workspace**. This uses VS Code's built-in session route and needs no Session Finder helper extension or extra mode flag. Stable sessions use `code`; Insiders sessions use `code-insiders`. The opening command selects the source user-data directory, including a custom directory with the standard `User/workspaceStorage` layout, so it reads the correct saved chat. Multi-root workspaces keep their exact `.code-workspace` target.
 
 Enter copies a `session-finder --open 'VSCode:ID'` command using this binary's path. Session Finder coordinates editor startup before opening the chat, because Code's initial URL handling can discard a session parameter. If Code is closed, the tool starts the recorded workspace, waits for the runtime URL handler, then restores the chat. When Code is already running, it opens a new target window and leaves the current workspace open. VS Code may show its standard local-file protocol confirmation; Session Finder does not change that security setting.
@@ -128,7 +130,11 @@ If reading a Claude, Codex, Copilot, or VS Code session file fails, the load or 
 
 Cursor's desktop SQLite database is read on every launch, using a consistent read-only snapshot that includes committed WAL updates. Session metadata supplies the exact workspace or worktree path and latest activity time. Subagent chats and empty drafts are excluded. Missing Cursor history is fine; a database error is reported while the other providers remain searchable.
 
-Cursor sessions are not written to the JSON cache. An open panel keeps its current snapshot until Ctrl-R refreshes it. Search includes user messages, session IDs, and full working directories; Cursor chat titles and VS Code workspace targets, titles, and participant IDs are also searchable. Ctrl-A adds assistant answers to the search.
+OpenCode's SQLite database is also read on every launch and Ctrl-R refresh, including committed WAL updates, without writing or migrating it. The default is `~/.local/share/opencode/opencode.db` on macOS and Linux; a nonempty `XDG_DATA_HOME` replaces `~/.local/share`. `OPENCODE_DB` selects another database, with relative values resolved under that OpenCode data directory. `SESSION_FINDER_OPENCODE_DB` takes precedence and selects a file directly, relative to the Finder process's directory when not absolute. Use it for custom or channel-specific databases. `:memory:` has no persistent history to scan.
+
+The reader supports v2 `session_v2` / `session_message` / `session_part` storage, earlier inline v2 answers, and v1 SQLite `session` / `message` / `part` storage. When v2 tables exist, they are authoritative, including after deletions; older retained v1 copies are not revived. Prompts, assistant text, titles, recorded directories, activity times, and archived state are indexed. Child sessions, synthetic prompts, tool output, reasoning, and compaction summaries are excluded. Sessions without human text or a valid absolute directory are skipped. Current v2 staged reverts hide the reverted tail; ambiguous or legacy partial reverts are omitted conservatively. The older JSON-directory format and remote servers are not scanned. A missing database is fine; errors produce a warning while other providers remain searchable.
+
+Cursor and OpenCode sessions are not written to the JSON cache. An open panel keeps its current snapshot until Ctrl-R refreshes it. Search includes user messages, session IDs, and full working directories; Cursor/OpenCode chat titles and VS Code workspace targets, titles, and participant IDs are also searchable. Ctrl-A adds assistant answers to the search.
 
 The cache contains user and assistant text in plain text, including assistant answers when assistant search is off. New cache directories are created with mode `0700`, and the cache file with mode `0600`. Cache updates use a temporary file and rename it into place. Session Finder does not upload history or the cache. The first launch after this update rebuilds older caches automatically.
 

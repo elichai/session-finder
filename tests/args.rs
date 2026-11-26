@@ -75,6 +75,7 @@ fn print_reports_missing_and_ambiguous_ids_without_selecting_a_session() {
             .env("SESSION_FINDER_COPILOT_ROOT", root.join("missing"))
             .env("SESSION_FINDER_VSCODE_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CURSOR_DB", root.join("missing.db"))
+            .env("SESSION_FINDER_OPENCODE_DB", root.join("missing.db"))
             .env("SESSION_FINDER_CACHE", root.join("index.json"))
             .output()
             .unwrap();
@@ -98,6 +99,7 @@ fn print_reports_missing_and_ambiguous_ids_without_selecting_a_session() {
         .env("SESSION_FINDER_COPILOT_ROOT", root.join("copilot"))
         .env("SESSION_FINDER_VSCODE_ROOT", root.join("missing"))
         .env("SESSION_FINDER_CURSOR_DB", root.join("missing.db"))
+        .env("SESSION_FINDER_OPENCODE_DB", root.join("missing.db"))
         .env("SESSION_FINDER_CACHE", root.join("index.json"))
         .output()
         .unwrap();

@@ -4,6 +4,7 @@ mod codex;
 mod copilot;
 mod cursor;
 mod json_lines;
+mod opencode;
 mod picker;
 mod session_files;
 mod timestamp;
@@ -30,6 +31,7 @@ pub enum Source {
     Claude,
     Codex,
     Copilot,
+    OpenCode,
     Cursor,
     VsCode,
 }
@@ -80,6 +82,7 @@ struct History {
     copilot_root: PathBuf,
     vscode_roots: Vec<PathBuf>,
     cursor_db: PathBuf,
+    opencode_db: PathBuf,
     cache_path: PathBuf,
 }
 
@@ -111,12 +114,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.action == Action::Help {
         print!(concat!(
             "Usage: session-finder [--fuzzy] [--list | --print SESSION_ID | --open SESSION_ID] [--rebuild]\n\n",
-            "Search local Claude, Codex, Copilot CLI, VS Code chat, and Cursor sessions, most recent first.\n",
+            "Search local Claude, Codex, Copilot CLI, OpenCode, VS Code chat, and Cursor sessions, most recent first.\n",
             "VS Code includes Copilot and other native Chat participants.\n",
             "Search matches the typed phrase; --fuzzy enables loose subsequence matching.\n",
             "Both modes use literal characters and smart case, without extended-search operators.\n",
             "Enter copies the resume command. Ctrl-O opens a supported app session. Esc cancels.\n",
             "Copilot CLI sessions resume in a terminal; use Enter or --print.\n",
+            "OpenCode sessions resume in an OpenCode v2 terminal; use Enter or --print.\n",
             "VS Code native chats open in their recorded workspace, including saved .code-workspace files.\n",
             "Enter copies a resume command; Ctrl-O opens the exact native chat without a helper extension.\n",
             "Recovery-only transcripts and unknown workspaces retain workspace-opening commands.\n",
@@ -134,6 +138,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Otherwise VS Code uses desktop, Insiders, and Remote server locations under $HOME.\n",
             "The sibling globalStorage/emptyWindowChatSessions directory is also read.\n",
             "SESSION_FINDER_CURSOR_DB overrides Cursor's local history database.\n",
+            "SESSION_FINDER_OPENCODE_DB overrides OpenCode's SQLite database.\n",
+            "Otherwise OpenCode uses $OPENCODE_DB or opencode/opencode.db under $XDG_DATA_HOME or ~/.local/share.\n",
         ));
         return Ok(());
     }
@@ -180,11 +186,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return open_gui(session);
         }
         warn_if_missing(session);
-        println!("{}", resume_command(session));
+        println!("{}", resume_command(session)?);
         return Ok(());
     }
     if sessions.is_empty() {
-        return Err("no Claude, Codex, Copilot CLI, VS Code chat, or Cursor sessions found".into());
+        return Err(
+            "no Claude, Codex, Copilot CLI, OpenCode, VS Code chat, or Cursor sessions found"
+                .into(),
+        );
     }
     let Some((selected, action)) = picker::choose(&sessions, args.fuzzy)? else {
         return Ok(());
@@ -199,7 +208,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return open_gui(session);
     }
     warn_if_missing(session);
-    let command = resume_command(session);
+    let command = resume_command(session)?;
     let copied = match Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
         Ok(mut child) => {
             let written = child
@@ -249,6 +258,8 @@ impl History {
                 "SESSION_FINDER_CURSOR_DB",
                 "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
             ),
+            opencode_db: opencode::database_path(&home)
+                .map_err(|_| "could not resolve OpenCode database path")?,
             cache_path: path("SESSION_FINDER_CACHE", ".cache/session-finder/index.json"),
         })
     }
@@ -377,6 +388,13 @@ impl History {
                 Vec::new()
             }
         };
+        let opencode_sessions = match opencode::scan(&self.opencode_db) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                eprintln!("Could not read OpenCode history: {error}");
+                Vec::new()
+            }
+        };
         let sessions = merge_sessions(
             cache
                 .entries
@@ -389,7 +407,8 @@ impl History {
                         session
                     })
                 })
-                .chain(cursor_sessions),
+                .chain(cursor_sessions)
+                .chain(opencode_sessions),
         );
         if debug {
             eprintln!(
@@ -504,6 +523,9 @@ fn write_cache(path: &Path, cache: &Cache) -> io::Result<()> {
 }
 
 fn gui_command(session: &Session) -> Result<Command, &'static str> {
+    if session.source == Source::OpenCode {
+        return Err("OpenCode sessions resume in a terminal; use Enter or --print to copy the resume command");
+    }
     if session.source == Source::Copilot {
         return Err("Copilot CLI has no supported desktop session link; use Enter or --print to copy its resume command");
     }
@@ -516,7 +538,7 @@ fn gui_command(session: &Session) -> Result<Command, &'static str> {
     let mut command = match session.source {
         Source::Claude => Command::new("claude"),
         Source::Codex | Source::Cursor => Command::new("open"),
-        Source::Copilot | Source::VsCode => unreachable!(),
+        Source::Copilot | Source::OpenCode | Source::VsCode => unreachable!(),
     };
     match session.source {
         Source::Claude => {
@@ -530,7 +552,7 @@ fn gui_command(session: &Session) -> Result<Command, &'static str> {
         Source::Cursor => {
             command.arg(cursor_url(session));
         }
-        Source::Copilot | Source::VsCode => unreachable!(),
+        Source::Copilot | Source::OpenCode | Source::VsCode => unreachable!(),
     }
     Ok(command)
 }
@@ -598,6 +620,7 @@ fn source_name(source: Source) -> &'static str {
         Source::Claude => "Claude",
         Source::Codex => "Codex",
         Source::Copilot => "Copilot",
+        Source::OpenCode => "OpenCode",
         Source::Cursor => "Cursor",
         Source::VsCode => "VSCode",
     }
@@ -609,6 +632,7 @@ fn display_source(session: &Session) -> &'static str {
         (Source::Codex, true) => "Codex*",
         (Source::Cursor, true) => "Cursor*",
         (Source::Copilot, true) => "Copilot*",
+        (Source::OpenCode, true) => "OpenCode*",
         (Source::VsCode, true) => "VSCode*",
         (source, false) => source_name(source),
     }
@@ -664,13 +688,26 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn resume_command(session: &Session) -> String {
+fn resume_command(session: &Session) -> io::Result<String> {
     let cwd = shell_quote(&session.cwd.to_string_lossy());
     let id = shell_quote(&session.id);
-    match session.source {
+    Ok(match session.source {
         Source::Claude => format!("cd -- {cwd} && claude --resume {id}"),
         Source::Codex => format!("codex resume {id} -C {cwd}"),
         Source::Copilot => ["cd -- ", &cwd, " && copilot --resume=", &id].concat(),
+        Source::OpenCode => {
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+            let database = opencode::database_path(&home)?;
+            [
+                "cd -- ",
+                &cwd,
+                " && OPENCODE_DB=",
+                &shell_quote(&database.to_string_lossy()),
+                " opencode --standalone --session ",
+                &id,
+            ]
+            .concat()
+        }
         Source::Cursor => ["open ", &shell_quote(&cursor_url(session))].concat(),
         Source::VsCode if vscode_open::command(session, true).is_ok() => {
             let executable = std::env::current_exe().unwrap_or_else(|_| "session-finder".into());
@@ -702,7 +739,7 @@ fn resume_command(session: &Session) -> String {
                 .unwrap_or(&session.cwd);
             [editor, " ", &shell_quote(&target.to_string_lossy())].concat()
         }
-    }
+    })
 }
 
 fn warn_if_missing(session: &Session) {
@@ -755,7 +792,7 @@ mod tests {
         for parts in [vec![empty.clone(), attached.clone()], vec![attached, empty]] {
             let merged = merge_sessions(parts);
             assert_eq!(merged.len(), 1);
-            assert_eq!(resume_command(&merged[0]), "code '/work'");
+            assert_eq!(resume_command(&merged[0]).unwrap(), "code '/work'");
         }
     }
 
@@ -773,7 +810,7 @@ mod tests {
             vscode: None,
         };
         assert_eq!(
-            resume_command(&session),
+            resume_command(&session).unwrap(),
             "cd -- '/tmp/O'\\''Brien; echo bad' && claude --resume 'abc'"
         );
     }
@@ -826,7 +863,10 @@ mod tests {
             archived: true,
             vscode: None,
         };
-        assert_eq!(resume_command(&session), "codex resume 'abc' -C '/work'");
+        assert_eq!(
+            resume_command(&session).unwrap(),
+            "codex resume 'abc' -C '/work'"
+        );
     }
 
     #[test]
@@ -865,7 +905,7 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             [std::ffi::OsStr::new(&url)]
         );
-        assert_eq!(resume_command(&session), "open 'cursor://session-finder.cursor-session-opener/open?id=019c675d-0e41-7f71-925f-1ccc0da0f692&cwd=%2Ftmp%2FO%27Brien%3B%20echo%20bad'");
+        assert_eq!(resume_command(&session).unwrap(), "open 'cursor://session-finder.cursor-session-opener/open?id=019c675d-0e41-7f71-925f-1ccc0da0f692&cwd=%2Ftmp%2FO%27Brien%3B%20echo%20bad'");
         session.cwd = "/tmp/é?&#".into();
         assert!(cursor_url(&session).ends_with("cwd=%2Ftmp%2F%C3%A9%3F%26%23"));
         session.id = "../new".into();

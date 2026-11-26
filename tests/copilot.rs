@@ -37,6 +37,7 @@ fn copilot_history_is_searchable_resumable_and_refreshed_automatically() {
             .env("SESSION_FINDER_CODEX_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CODEX_ARCHIVE_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CURSOR_DB", root.join("missing.db"))
+            .env("SESSION_FINDER_OPENCODE_DB", root.join("missing.db"))
             .env("SESSION_FINDER_CACHE", root.join("index.json"));
         if override_root {
             command

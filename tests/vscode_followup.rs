@@ -45,6 +45,7 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
         .env("SESSION_FINDER_CODEX_ARCHIVE_ROOT", root.join("missing"))
         .env("SESSION_FINDER_COPILOT_ROOT", root.join("missing"))
         .env("SESSION_FINDER_CURSOR_DB", root.join("missing.db"))
+        .env("SESSION_FINDER_OPENCODE_DB", root.join("missing.db"))
         .env("SESSION_FINDER_CACHE", root.join("index.json"))
         .output()
         .unwrap();
