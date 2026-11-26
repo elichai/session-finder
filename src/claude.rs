@@ -19,6 +19,16 @@ struct ClaudeRow<'a> {
     timestamp: Option<&'a RawValue>,
     #[serde(borrow)]
     message: Option<&'a RawValue>,
+    #[serde(rename = "isSidechain", borrow)]
+    is_sidechain: Option<&'a RawValue>,
+    #[serde(rename = "isMeta", borrow)]
+    is_meta: Option<&'a RawValue>,
+    #[serde(rename = "isCompactSummary", borrow)]
+    is_compact_summary: Option<&'a RawValue>,
+    #[serde(rename = "isVisibleInTranscriptOnly", borrow)]
+    is_visible_in_transcript_only: Option<&'a RawValue>,
+    #[serde(rename = "relocatedCwd", borrow)]
+    relocated_cwd: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +86,7 @@ fn parse_reader(path: &Path, reader: impl BufRead) -> io::Result<Option<Session>
     let mut preview = String::new();
     let mut updated = 0;
     let mut genuine = false;
+    let mut sidechain = false;
     let mut lines = JsonLines::new(reader);
     while let Some(line) = lines.next_line()? {
         let Ok(row) = serde_json::from_slice::<ClaudeRow<'_>>(line) else {
@@ -84,11 +95,22 @@ fn parse_reader(path: &Path, reader: impl BufRead) -> io::Result<Option<Session>
         if row.session_id.as_deref() != Some(id.as_str()) {
             continue;
         }
+        sidechain |= row.is_sidechain.is_some_and(|flag| flag.get() == "true");
         if let Some(dir) = row
             .cwd
             .and_then(|raw| serde_json::from_str::<BorrowedStr<'_>>(raw.get()).ok())
         {
             cwd.get_or_insert_with(|| PathBuf::from(&*dir));
+        }
+        if row.kind.as_deref() == Some("relocated") {
+            if let Some(dir) = row
+                .relocated_cwd
+                .and_then(|raw| serde_json::from_str::<BorrowedStr<'_>>(raw.get()).ok())
+            {
+                if Path::new(&*dir).is_absolute() && !dir.contains('\0') {
+                    cwd = Some(PathBuf::from(&*dir));
+                }
+            }
         }
         if let Some(ts) = row
             .timestamp
@@ -100,6 +122,17 @@ fn parse_reader(path: &Path, reader: impl BufRead) -> io::Result<Option<Session>
         if !matches!(row.kind.as_deref(), Some("user" | "assistant")) {
             continue;
         }
+        if [
+            row.is_meta,
+            row.is_compact_summary,
+            row.is_visible_in_transcript_only,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|flag| flag.get() == "true")
+        {
+            continue;
+        }
         let assistant = row.kind.as_deref() == Some("assistant");
         genuine |= !assistant;
         let Some(message) = row.message else {
@@ -108,7 +141,10 @@ fn parse_reader(path: &Path, reader: impl BufRead) -> io::Result<Option<Session>
         let Ok(message) = serde_json::from_str::<ClaudeMessage<'_>>(message.get()) else {
             continue;
         };
-        if let Some(text) = user_text(message.content) {
+        if let Some(mut text) = user_text(message.content) {
+            if !assistant {
+                text = strip_ide_context(text);
+            }
             if !text.trim().is_empty() {
                 if preview.is_empty() && !assistant {
                     preview = text.chars().take(240).collect();
@@ -125,7 +161,7 @@ fn parse_reader(path: &Path, reader: impl BufRead) -> io::Result<Option<Session>
             }
         }
     }
-    if !genuine {
+    if !genuine || sidechain {
         return Ok(None);
     }
     let Some(cwd) = cwd else {
@@ -149,6 +185,26 @@ fn parse_reader(path: &Path, reader: impl BufRead) -> io::Result<Option<Session>
         archived: false,
         vscode: None,
     }))
+}
+
+fn strip_ide_context(text: String) -> String {
+    for (prefix, trailer) in [
+        (
+            "<ide_opened_file>The user opened the file ",
+            " in the IDE. This may or may not be related to the current task.</ide_opened_file>",
+        ),
+        (
+            "<ide_selection>The user selected the lines ",
+            "\n\nThis may or may not be related to the current task.</ide_selection>",
+        ),
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            if let Some(end) = rest.find(trailer) {
+                return rest[end + trailer.len()..].trim_start().to_owned();
+            }
+        }
+    }
+    text
 }
 
 fn user_text(value: Option<&RawValue>) -> Option<String> {
@@ -176,7 +232,151 @@ fn parse_timestamp(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::borrow::Cow;
+
+    fn parse_rows(rows: &[serde_json::Value]) -> Option<Session> {
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let input = std::iter::once(json!({
+            "type": "system", "cwd": "/work", "timestamp": "2025-01-01T00:00:00Z"
+        }))
+        .chain(rows.iter().cloned())
+        .map(|mut row| {
+            row.as_object_mut()
+                .unwrap()
+                .entry("sessionId")
+                .or_insert(json!(id));
+            row.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+        parse_reader(Path::new(&format!("{id}.jsonl")), input.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn extension_metadata_does_not_become_conversation_text() {
+        for flag in ["isMeta", "isCompactSummary", "isVisibleInTranscriptOnly"] {
+            let mut synthetic = json!({"type": "user", "message": {"content": "hidden context"}});
+            synthetic[flag] = json!(true);
+            assert!(parse_rows(&[synthetic.clone()]).is_none(), "{flag}");
+            let mut synthetic_assistant = synthetic.clone();
+            synthetic_assistant["type"] = json!("assistant");
+            let session = parse_rows(&[
+                synthetic,
+                synthetic_assistant,
+                json!({"type": "user", "entrypoint": "claude-vscode", "message": {"content": "real prompt"}}),
+                json!({"type": "assistant", "message": {"content": "real answer"}}),
+            ]).unwrap();
+            assert_eq!(session.source, Source::Claude);
+            assert_eq!(session.search_text, "real prompt", "{flag}");
+            assert_eq!(session.preview, "real prompt", "{flag}");
+            assert_eq!(session.assistant_text, "real answer", "{flag}");
+            for value in [json!(false), json!(null), json!("true"), json!(7)] {
+                let mut prompt = json!({"type": "user", "message": {"content": "keep prompt"}});
+                prompt[flag] = value;
+                assert_eq!(parse_rows(&[prompt]).unwrap().search_text, "keep prompt");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_sidechain_sessions_but_ignores_other_session_metadata() {
+        let prompt = json!({"type": "user", "message": {"content": "real prompt"}});
+        assert!(parse_rows(&[
+            prompt.clone(),
+            json!({"type": "assistant", "isSidechain": true, "message": {"content": "agent answer"}}),
+        ]).is_none());
+        assert!(parse_rows(&[
+            json!({"type": "user", "isSidechain": true, "message": {"content": "agent prompt"}}),
+        ])
+        .is_none());
+        assert!(parse_rows(&[
+            json!({"type": "user", "sessionId": "another-session", "isSidechain": true, "message": {"content": "unrelated"}}),
+            prompt,
+        ]).is_some());
+    }
+
+    #[test]
+    fn relocation_metadata_uses_latest_valid_absolute_directory() {
+        let session = parse_rows(&[
+            json!({"type": "user", "message": {"content": "real prompt"}}),
+            json!({"type": "relocated", "relocatedCwd": "/first"}),
+            json!({"type": "relocated", "relocatedCwd": "/latest"}),
+            json!({"type": "relocated", "relocatedCwd": ""}),
+            json!({"type": "relocated", "relocatedCwd": "relative/path"}),
+            json!({"type": "relocated", "relocatedCwd": 7}),
+            json!({"type": "relocated", "relocatedCwd": "/invalid\0path"}),
+            json!({"type": "relocated", "sessionId": "another-session", "relocatedCwd": "/unrelated"}),
+            json!({"type": "assistant", "cwd": "/work", "relocatedCwd": "/wrong-type", "message": {"content": "answer"}}),
+        ]).unwrap();
+        assert_eq!(session.cwd, PathBuf::from("/latest"));
+        assert_eq!(session.updated, 1_735_689_600);
+    }
+
+    #[test]
+    fn strips_ide_context_from_user_strings_and_arrays_but_preserves_prompts() {
+        let opened = "<ide_opened_file>The user opened the file /work/lib.rs in the IDE. This may or may not be related to the current task.</ide_opened_file>";
+        let selection = "<ide_selection>The user selected the lines 1 to 2 from /work/lib.rs:\nprivate selection\n\nThis may or may not be related to the current task.</ide_selection>";
+        let prompt = "בדוק β <ide_selection>The user selected the lines 1 to 2 from /example:\nliteral</ide_selection>";
+        for content in [
+            json!(format!("{opened}\n{prompt}")),
+            json!(format!("{selection}\n{prompt}")),
+            json!([
+                {"type": "text", "text": opened},
+                {"type": "text", "text": prompt},
+            ]),
+            json!([
+                {"type": "text", "text": selection},
+                {"type": "text", "text": prompt},
+            ]),
+        ] {
+            let session = parse_rows(&[
+                json!({"type": "user", "message": {"content": content}}),
+                json!({"type": "assistant", "message": {"content": "<ide_selection>example</ide_selection>"}}),
+            ]).unwrap();
+            assert_eq!(session.search_text, prompt);
+            assert_eq!(session.preview, prompt);
+            assert_eq!(
+                session.assistant_text,
+                "<ide_selection>example</ide_selection>"
+            );
+        }
+        let second_prefix = format!("{opened} {selection}");
+        let session =
+            parse_rows(&[json!({"type": "user", "message": {"content": second_prefix}})]).unwrap();
+        assert_eq!(session.search_text, selection);
+    }
+
+    #[test]
+    fn preserves_literal_and_incomplete_ide_context_markers() {
+        for prompt in [
+            "<ide_selection>example</ide_selection> explain this",
+            "<ide_opened_file>example</ide_opened_file> explain this",
+            "explain <ide_selection>example</ide_selection>",
+            "```xml\n<ide_opened_file>The user opened the file /example in the IDE. This may or may not be related to the current task.</ide_opened_file>\n```",
+            "<ide_selection>The user selected the lines 1 to 2 from /work:\nunfinished",
+            "<ide_selection>The user selected the lines 1 to 2 from /work:\nwrong trailer</ide_selection>",
+            "<ide_opened_file>The user opened the file /work but no closing marker",
+        ] {
+            let session = parse_rows(&[
+                json!({"type": "user", "message": {"content": prompt}}),
+            ]).unwrap();
+            assert_eq!(session.search_text, prompt);
+        }
+    }
+
+    #[test]
+    fn keeps_real_user_sessions_without_text() {
+        for content in [
+            json!([]),
+            json!([{"type": "image", "source": {"type": "base64"}}]),
+        ] {
+            let session =
+                parse_rows(&[json!({"type": "user", "message": {"content": content}})]).unwrap();
+            assert_eq!(session.search_text, "");
+            assert_eq!(session.cwd, PathBuf::from("/work"));
+        }
+    }
 
     #[test]
     fn read_errors_do_not_return_a_partial_session() {

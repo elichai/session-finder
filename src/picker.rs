@@ -50,7 +50,7 @@ pub fn write_rows(sessions: &[Session], output: &mut impl Write) -> io::Result<(
     Ok(())
 }
 
-fn command(fuzzy: bool) -> io::Result<Command> {
+fn command(fuzzy: bool, editor: Option<crate::vscode::Editor>) -> io::Result<Command> {
     let executable = std::env::current_exe()?;
     let executable = shell_quote(&executable.to_string_lossy());
     let mut picker = Command::new("fzf");
@@ -68,7 +68,11 @@ fn command(fuzzy: bool) -> io::Result<Command> {
         "--layout=reverse",
         "--border",
         "--height=90%",
-        "--prompt=Sessions> ",
+        match editor {
+            Some(crate::vscode::Editor::Code) => "--prompt=VS Code> ",
+            Some(crate::vscode::Editor::Insiders) => "--prompt=VS Code Insiders> ",
+            None => "--prompt=Sessions> ",
+        },
         "--preview-window=down,10,wrap",
         "--preview-label=Selected session",
         "--no-extended",
@@ -82,14 +86,23 @@ fn command(fuzzy: bool) -> io::Result<Command> {
         if fuzzy { "fuzzy" } else { "exact" }
     ));
     picker.arg(format!("--bind=ctrl-a:change-with-nth(2..8|2..6,8)+transform-header({executable} --picker-header)+refresh-preview"));
+    let rows = if editor.is_some() {
+        "--picker-extension-rows"
+    } else {
+        "--picker-rows"
+    };
     picker.arg(format!(
-        "--bind=ctrl-r:reload-sync({executable} --picker-rows)+refresh-preview"
+        "--bind=ctrl-r:reload-sync({executable} {rows})+refresh-preview"
     ));
     Ok(picker)
 }
 
-pub fn choose(sessions: &[Session], fuzzy: bool) -> io::Result<Option<(String, SelectionAction)>> {
-    let mut child = command(fuzzy)?
+pub fn choose(
+    sessions: &[Session],
+    fuzzy: bool,
+    editor: Option<crate::vscode::Editor>,
+) -> io::Result<Option<(String, SelectionAction)>> {
+    let mut child = command(fuzzy, editor)?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;

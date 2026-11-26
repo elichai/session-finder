@@ -1,0 +1,13 @@
+{
+  "name": "vscode-session-opener",
+  "displayName": "Session Finder",
+  "description": "Open existing Claude Code and Codex chats in their recorded local workspace.",
+  "publisher": "session-finder",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onUri", "onStartupFinished"],
+  "extensionKind": ["ui"],
+  "main": "./extension.js"
+}
