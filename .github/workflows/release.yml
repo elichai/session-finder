@@ -83,6 +83,7 @@ jobs:
           SESSION_FINDER_COPILOT_ROOT: /nonexistent/copilot
           SESSION_FINDER_VSCODE_ROOT: /nonexistent/vscode
           SESSION_FINDER_CURSOR_DB: /nonexistent/cursor.db
+          SESSION_FINDER_OPENCODE_DB: /nonexistent/opencode.db
         run: |
           export SESSION_FINDER_CACHE="$RUNNER_TEMP/session-finder/index.json"
           binary="target/$TARGET/release/session-finder"

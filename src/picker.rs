@@ -34,7 +34,7 @@ pub fn write_rows(sessions: &[Session], output: &mut impl Write) -> io::Result<(
     for session in sessions {
         writeln!(
             output,
-            "{}\t{:>8}  {:<7}  {:<28}\t{:<60}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{:>8}  {:<9}  {:<28}\t{:<60}\t{}\t{}\t{}\t{}\t{}",
             identity(session),
             age(session.updated),
             display_source(session),
@@ -129,6 +129,8 @@ fn selection(status: ExitStatus, output: &[u8]) -> io::Result<Option<(String, Se
     let valid = key.split_once(':').is_some_and(|(source, id)| {
         if source == "Copilot" {
             !id.is_empty() && !id.chars().any(char::is_control)
+        } else if source == "OpenCode" {
+            crate::opencode::is_session_id(id)
         } else {
             matches!(source, "Claude" | "Codex" | "Cursor" | "VSCode") && crate::codex::is_uuid(id)
         }
@@ -230,6 +232,11 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
     if fields[0].starts_with("Copilot:") {
         output.push_str("Copilot CLI: Enter copies a terminal resume command; desktop opening is unavailable.\n");
     }
+    if fields[0].starts_with("OpenCode:") {
+        output.push_str(
+            "OpenCode: Enter copies a terminal resume command; desktop opening is unavailable.\n",
+        );
+    }
     if fields[0].starts_with("VSCode:") {
         output.push_str(
             "Ctrl-O restores a saved native chat in its workspace. Enter copies the resume command; recovery-only chats use a workspace command.\n",
@@ -306,6 +313,29 @@ fn preview(row: &str, query: &str, fuzzy: bool, assistant: bool) -> io::Result<S
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn opencode_selections_accept_native_ids_and_explain_terminal_resume() {
+        assert_eq!(
+            selection(ExitStatus::from_raw(0), b"\nOpenCode:ses_test123\n").unwrap(),
+            Some(("OpenCode:ses_test123".into(), SelectionAction::Copy))
+        );
+        for value in [
+            b"\nOpenCode:\n".as_slice(),
+            b"\nOpenCode:ses_../bad\n",
+            b"\nOpenCode:ses_a\tb\n",
+        ] {
+            assert!(selection(ExitStatus::from_raw(0), value).is_err());
+        }
+        let text = preview(
+            "OpenCode:ses_test123\tnow\topening\trequest\t/work\tses_test123\tanswer",
+            "",
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(text.contains("Enter copies a terminal resume command"));
+    }
 
     #[test]
     fn copilot_selections_accept_custom_ids_and_explain_terminal_resume() {

@@ -63,6 +63,7 @@ fn vscode_copilot_chat_history_is_searchable_with_and_without_workspace_metadata
             .env("SESSION_FINDER_CODEX_ARCHIVE_ROOT", root.join("missing"))
             .env("SESSION_FINDER_COPILOT_ROOT", root.join("missing"))
             .env("SESSION_FINDER_CURSOR_DB", root.join("missing.db"))
+            .env("SESSION_FINDER_OPENCODE_DB", root.join("missing.db"))
             .env("SESSION_FINDER_CACHE", root.join("index.json"));
         if override_root {
             command.env("HOME", root.join("wrong")).env(
